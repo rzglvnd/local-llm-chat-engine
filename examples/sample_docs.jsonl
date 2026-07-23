@@ -1,0 +1,3 @@
+{"id": "doc1", "text": "How to deploy a FastAPI application with Uvicorn and Docker.", "metadata": {"topic": "deployment"}}
+{"id": "doc2", "text": "RAG: combine retrieval with generation for factual grounding.", "metadata": {"topic": "RAG"}}
+{"id": "doc3", "text": "Token limits and chunking strategies for long documents.", "metadata": {"topic": "llm"}}
