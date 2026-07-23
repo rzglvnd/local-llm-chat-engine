@@ -17,7 +17,12 @@ class HuggingFaceAdapter:
 
     def generate(self, prompt: str, context=None, max_new_tokens: int = 128, **kwargs) -> str:
         input_text = prompt if not context else "\n".join(context) + "\n\n" + prompt
-        outputs = self.generator(input_text, max_new_tokens=max_new_tokens, do_sample=True, **kwargs)
+        outputs = self.generator(
+            input_text,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            **kwargs,
+        )
         if outputs and isinstance(outputs, list):
             return outputs[0].get("generated_text", "")
         return str(outputs)

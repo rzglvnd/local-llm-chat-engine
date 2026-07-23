@@ -1,0 +1,53 @@
+from dataclasses import dataclass
+import os
+from typing import List
+
+
+def _as_bool(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _as_int(value: str, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _as_list(value: str) -> List[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+@dataclass(frozen=True)
+class Settings:
+    host: str
+    port: int
+    log_level: str
+    default_k: int
+    max_k: int
+    api_key: str
+    cors_origins: List[str]
+    snapshot_path: str
+    request_logging: bool
+    stream_chunk_size: int
+
+
+def load_settings() -> Settings:
+    return Settings(
+        host=os.environ.get("LOCAL_LLM_HOST", "0.0.0.0"),
+        port=_as_int(os.environ.get("LOCAL_LLM_PORT"), 8001),
+        log_level=os.environ.get("LOCAL_LLM_LOG_LEVEL", "INFO"),
+        default_k=_as_int(os.environ.get("LOCAL_LLM_DEFAULT_K"), 3),
+        max_k=max(1, _as_int(os.environ.get("LOCAL_LLM_MAX_K"), 20)),
+        api_key=os.environ.get("LOCAL_LLM_API_KEY", "").strip(),
+        cors_origins=_as_list(os.environ.get("LOCAL_LLM_CORS_ORIGINS", "")),
+        snapshot_path=os.environ.get("LOCAL_LLM_SNAPSHOT_PATH", "./data/store.pkl"),
+        request_logging=_as_bool(os.environ.get("LOCAL_LLM_REQUEST_LOGGING"), True),
+        stream_chunk_size=max(1, _as_int(os.environ.get("LOCAL_LLM_STREAM_CHUNK_SIZE"), 64)),
+    )

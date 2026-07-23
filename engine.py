@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 
 class BaseModel:
@@ -29,7 +29,10 @@ class OpenAIModel(BaseModel):
     def generate(self, prompt: str, context: Optional[List[str]] = None) -> str:
         if not self.openai:
             return "OpenAI client not available — install `openai` and set OPENAI_API_KEY"
-        messages = [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}]
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
         if context:
             messages.insert(1, {"role": "assistant", "content": "Context:\n" + "\n".join(context)})
         resp = self.openai.ChatCompletion.create(model="gpt-4o-mini", messages=messages)

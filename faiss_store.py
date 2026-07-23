@@ -68,10 +68,17 @@ class FaissStore:
             return []
         q_emb = self.embedder.encode([query], convert_to_numpy=True).astype("float32")
         q_emb = q_emb / (np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-9)
-        D, I = self.index.search(q_emb, k)
+        scores, indices = self.index.search(q_emb, k)
         results = []
-        for score, idx in zip(D[0], I[0]):
+        for score, idx in zip(scores[0], indices[0]):
             if idx < 0:
                 continue
-            results.append({"id": self.ids[idx], "score": float(score), "text": self.docs[idx], "metadata": self.metadatas[idx]})
+            results.append(
+                {
+                    "id": self.ids[idx],
+                    "score": float(score),
+                    "text": self.docs[idx],
+                    "metadata": self.metadatas[idx],
+                }
+            )
         return results

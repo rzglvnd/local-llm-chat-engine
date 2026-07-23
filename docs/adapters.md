@@ -2,8 +2,12 @@
 
 This repository provides adapter interfaces for different model backends:
 
-- `adapters/openai_adapter.py` — uses the OpenAI Python SDK and supports streaming via server-sent events (SSE).
-- `adapters/huggingface_adapter.py` — wraps `transformers` pipelines; streaming is a best-effort chunked fallback.
+- `adapters/openai_adapter.py`
+	- Supports both modern (`OpenAI`) and legacy (`ChatCompletion`) SDK shapes.
+	- Native token streaming support.
+- `adapters/huggingface_adapter.py`
+	- Wraps `transformers` text-generation pipeline.
+	- Streaming is best-effort chunking after generation.
 
 Usage examples
 
@@ -14,6 +18,11 @@ curl -N -X POST http://127.0.0.1:8001/chat_stream -H "Content-Type: application/
 ```
 
 2. Non-streaming usage — POST `/chat` with `{ "message": "..." }`.
+
+Configuration
+
+- `OPENAI_API_KEY` for OpenAI backend.
+- `LOCAL_LLM_STREAM_CHUNK_SIZE` controls fallback chunking size.
 
 Notes
 

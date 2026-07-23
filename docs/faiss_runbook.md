@@ -12,7 +12,8 @@ Install (local, minimal):
 
 ```bash
 python -m pip install --upgrade pip
-pip install faiss-cpu sentence-transformers
+pip install -r requirements.txt
+pip install -r requirements-optional.txt
 ```
 
 If installation fails on Windows, use the Docker Compose flow (recommended):
@@ -25,6 +26,7 @@ Endpoints
 
 - `POST /ingest_faiss` — JSON `{ "documents": [{"id":"...","text":"...","metadata":{}}] }`
 - `POST /search_faiss` — JSON `{ "query": "...", "k": 5 }` returns top-k results.
+- `POST /search_auto` — routes to FAISS when available.
 
 Example (curl):
 

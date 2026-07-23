@@ -1,11 +1,26 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
-from store import DocumentStore
-from engine import EchoModel
-import os
 import json
+import logging
+import os
+import time
+from typing import Any, Dict, List, Literal, Optional
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from engine import EchoModel
+from settings import load_settings
+from store import DocumentStore
+
+settings = load_settings()
+
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("local_llm_chat_engine")
 
 # embedding/FAISS optional backends
 try:
@@ -50,13 +65,161 @@ except Exception:
 
 app = FastAPI(title="Local LLM Chat Engine")
 
+if settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 store = DocumentStore()
 model = EchoModel()
 
 
+def _model_dump(model_obj: BaseModel) -> Dict[str, Any]:
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump(exclude_none=True)
+    return model_obj.dict(exclude_none=True)
+
+
+def _sanitize_k(k: int) -> int:
+    return max(1, min(k, settings.max_k))
+
+
 class ChatRequest(BaseModel):
-    message: str
-    k: Optional[int] = 3
+    message: str = Field(min_length=1)
+    k: int = Field(default=settings.default_k, ge=1)
+    model: Literal["echo", "openai", "hf"] = "echo"
+
+
+class DocumentInput(BaseModel):
+    id: Optional[str] = None
+    text: Optional[str] = None
+    content: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class IngestRequest(BaseModel):
+    documents: List[DocumentInput] = Field(min_length=1)
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    k: int = Field(default=settings.default_k, ge=1)
+
+
+class SnapshotRequest(BaseModel):
+    path: Optional[str] = None
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
+    if settings.api_key and x_api_key != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def _normalize_documents(items: List[DocumentInput]) -> List[Dict[str, Any]]:
+    docs: List[Dict[str, Any]] = []
+    for item in items:
+        raw = _model_dump(item)
+        text = raw.get("text") or raw.get("content")
+        if not text:
+            continue
+        docs.append(
+            {
+                "id": raw.get("id"),
+                "text": text,
+                "metadata": raw.get("metadata") or {},
+            }
+        )
+    if not docs:
+        raise HTTPException(status_code=400, detail="No valid documents were provided")
+    return docs
+
+
+def _resolve_adapter(model_name: str):
+    if model_name == "echo":
+        return model
+    if model_name == "openai":
+        if not openai_adapter_available:
+            raise HTTPException(status_code=400, detail="OpenAI adapter not available")
+        try:
+            return OpenAIAdapter(api_key=os.environ.get("OPENAI_API_KEY"))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"OpenAI adapter initialization failed: {exc}",
+            )
+    if model_name == "hf":
+        if not hf_adapter_available:
+            raise HTTPException(status_code=400, detail="HuggingFace adapter not available")
+        try:
+            return HuggingFaceAdapter()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"HuggingFace adapter initialization failed: {exc}",
+            )
+    raise HTTPException(status_code=400, detail=f"Unsupported model '{model_name}'")
+
+
+def _backend_status() -> Dict[str, Any]:
+    return {
+        "stores": {
+            "tfidf": store.stats(),
+            "embeddings": {
+                "available": embeddings_available,
+                "initialized": embedding_store is not None,
+            },
+            "faiss": {
+                "available": faiss_available,
+                "initialized": faiss_store is not None,
+            },
+        },
+        "adapters": {
+            "openai": openai_adapter_available,
+            "huggingface": hf_adapter_available,
+            "echo": True,
+        },
+    }
+
+
+def _safe_stream_text(text: str):
+    if not text:
+        return
+    chunk_size = max(1, settings.stream_chunk_size)
+    for i in range(0, len(text), chunk_size):
+        yield text[i : i + chunk_size]
+
+
+@app.middleware("http")
+async def attach_request_id_and_log(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", uuid4().hex)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "request_id=%s path=%s method=%s unhandled_error",
+            request_id,
+            request.url.path,
+            request.method,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["x-request-id"] = request_id
+    if settings.request_logging:
+        logger.info(
+            "request_id=%s method=%s path=%s status=%s duration_ms=%.2f",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+    return response
 
 
 @app.get("/health")
@@ -64,53 +227,69 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/ready")
+async def ready():
+    return {"status": "ok", **_backend_status()}
+
+
 @app.post("/ingest")
-async def ingest(payload: dict):
-    documents = payload.get("documents")
-    if not documents:
-        raise HTTPException(status_code=400, detail="Missing 'documents' list")
+async def ingest(payload: IngestRequest, _: None = Depends(require_api_key)):
+    documents = _normalize_documents(payload.documents)
     res = store.ingest(documents)
     return res
 
 
 @app.post("/ingest_embeddings")
-async def ingest_embeddings(payload: dict):
+async def ingest_embeddings(payload: IngestRequest, _: None = Depends(require_api_key)):
     if not embeddings_available or embedding_store is None:
-        raise HTTPException(status_code=400, detail="Embeddings not available. Install sentence-transformers.")
-    documents = payload.get("documents")
-    if not documents:
-        raise HTTPException(status_code=400, detail="Missing 'documents' list")
+        raise HTTPException(
+            status_code=400,
+            detail="Embeddings not available. Install sentence-transformers.",
+        )
+    documents = _normalize_documents(payload.documents)
     res = embedding_store.ingest(documents)
     return res
 
 
 @app.post("/search")
-async def search(payload: dict):
-    query = payload.get("query")
-    k = int(payload.get("k", 5))
-    if not query:
-        raise HTTPException(status_code=400, detail="Missing 'query'")
+async def search(payload: SearchRequest):
+    k = _sanitize_k(payload.k)
+    query = payload.query
     return {"results": store.search(query, k=k)}
 
 
 @app.post("/search_embeddings")
-async def search_embeddings(payload: dict):
+async def search_embeddings(payload: SearchRequest):
     if not embeddings_available or embedding_store is None:
-        raise HTTPException(status_code=400, detail="Embeddings not available. Install sentence-transformers.")
-    query = payload.get("query")
-    k = int(payload.get("k", 5))
-    if not query:
-        raise HTTPException(status_code=400, detail="Missing 'query'")
+        raise HTTPException(
+            status_code=400,
+            detail="Embeddings not available. Install sentence-transformers.",
+        )
+    query = payload.query
+    k = _sanitize_k(payload.k)
     return {"results": embedding_store.search(query, k=k)}
+
+
+@app.post("/search_auto")
+async def search_auto(payload: SearchRequest):
+    query = payload.query
+    k = _sanitize_k(payload.k)
+
+    if faiss_available and faiss_store is not None:
+        return {"backend": "faiss", "results": faiss_store.search(query, k=k)}
+    if embeddings_available and embedding_store is not None:
+        return {"backend": "embeddings", "results": embedding_store.search(query, k=k)}
+    return {"backend": "tfidf", "results": store.search(query, k=k)}
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     query = req.message
-    k = req.k or 3
+    k = _sanitize_k(req.k)
     contexts = [r["text"] for r in store.search(query, k=k)]
-    resp = model.generate(query, context=contexts)
-    return {"response": resp, "context_count": len(contexts)}
+    adapter = _resolve_adapter(req.model)
+    resp = adapter.generate(query, context=contexts)
+    return {"model": req.model, "response": resp, "context_count": len(contexts)}
 
 
 def _sse_encode(obj: dict) -> str:
@@ -119,65 +298,77 @@ def _sse_encode(obj: dict) -> str:
 
 
 @app.post("/chat_stream")
-async def chat_stream(payload: dict):
-    message = payload.get("message")
-    if not message:
-        raise HTTPException(status_code=400, detail="Missing 'message'")
-    model_name = payload.get("model", "echo")
-    k = int(payload.get("k", 3))
+async def chat_stream(payload: ChatRequest):
+    message = payload.message
+    model_name = payload.model
+    k = _sanitize_k(payload.k)
 
-    # choose adapter
-    adapter = None
-    if model_name == "openai":
-        if not openai_adapter_available:
-            raise HTTPException(status_code=400, detail="OpenAI adapter not available")
-        adapter = OpenAIAdapter(api_key=os.environ.get("OPENAI_API_KEY"))
-    elif model_name == "hf":
-        if not hf_adapter_available:
-            raise HTTPException(status_code=400, detail="HuggingFace adapter not available")
-        adapter = HuggingFaceAdapter()
-    else:
-        adapter = model
+    adapter = _resolve_adapter(model_name)
 
     # get context from store
     contexts = [r["text"] for r in store.search(message, k=k)]
 
     def event_stream():
+        yield _sse_encode({"event": "start", "model": model_name})
         # adapter may be an EchoModel with no stream() method
         if hasattr(adapter, "stream"):
             for chunk in adapter.stream(message, context=contexts):
-                yield _sse_encode({"text": chunk})
+                if chunk:
+                    yield _sse_encode({"event": "chunk", "text": chunk})
         else:
             # fallback to generate then stream in chunks
             text = adapter.generate(message, context=contexts)
-            for i in range(0, len(text), 64):
-                yield _sse_encode({"text": text[i : i + 64]})
+            for chunk in _safe_stream_text(text):
+                yield _sse_encode({"event": "chunk", "text": chunk})
+        yield _sse_encode({"event": "done"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+@app.post("/snapshot/save")
+async def save_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
+    path = payload.path or settings.snapshot_path
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    store.save(path)
+    return {"saved": path, "documents": store.stats()["documents"]}
+
+
+@app.post("/snapshot/load")
+async def load_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
+    path = payload.path or settings.snapshot_path
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Snapshot not found at '{path}'")
+    store.load(path)
+    return {"loaded": path, "documents": store.stats()["documents"]}
+
+
 @app.post("/ingest_faiss")
-async def ingest_faiss(payload: dict):
+async def ingest_faiss(payload: IngestRequest, _: None = Depends(require_api_key)):
     if not faiss_available or faiss_store is None:
-        raise HTTPException(status_code=400, detail="FAISS store not available. Install faiss and sentence-transformers.")
-    documents = payload.get("documents")
-    if not documents:
-        raise HTTPException(status_code=400, detail="Missing 'documents' list")
+        raise HTTPException(
+            status_code=400,
+            detail="FAISS store not available. Install faiss and sentence-transformers.",
+        )
+    documents = _normalize_documents(payload.documents)
     return faiss_store.ingest(documents)
 
 
 @app.post("/search_faiss")
-async def search_faiss(payload: dict):
+async def search_faiss(payload: SearchRequest):
     if not faiss_available or faiss_store is None:
-        raise HTTPException(status_code=400, detail="FAISS store not available. Install faiss and sentence-transformers.")
-    query = payload.get("query")
-    k = int(payload.get("k", 5))
-    if not query:
-        raise HTTPException(status_code=400, detail="Missing 'query'")
+        raise HTTPException(
+            status_code=400,
+            detail="FAISS store not available. Install faiss and sentence-transformers.",
+        )
+    query = payload.query
+    k = _sanitize_k(payload.k)
     return {"results": faiss_store.search(query, k=k)}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+
+    uvicorn.run(app, host=settings.host, port=settings.port)
 

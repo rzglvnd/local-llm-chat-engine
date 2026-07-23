@@ -66,5 +66,12 @@ class EmbeddingStore:
         results = []
         for dist, i in zip(dists[0], idx[0]):
             score = 1 - float(dist)
-            results.append({"id": self.ids[i], "score": score, "text": self.docs[i], "metadata": self.metadatas[i]})
+            results.append(
+                {
+                    "id": self.ids[i],
+                    "score": score,
+                    "text": self.docs[i],
+                    "metadata": self.metadatas[i],
+                }
+            )
         return results

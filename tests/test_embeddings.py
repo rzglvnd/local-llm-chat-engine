@@ -13,7 +13,10 @@ def test_embeddings_basic():
     try:
         store = EmbeddingStore()
     except Exception:
-        pytest.skip("sentence-transformers backend not available at runtime; skipping embeddings test")
+        pytest.skip(
+            "sentence-transformers backend not available at runtime; "
+            "skipping embeddings test"
+        )
     docs = [
         {"id": "1", "text": "Machine learning and transformers."},
         {"id": "2", "text": "Databases and SQL tuning."},

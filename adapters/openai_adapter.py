@@ -1,4 +1,6 @@
 """OpenAI adapter with optional streaming support."""
+import os
+
 try:
     import openai
     OPENAI_AVAILABLE = True
@@ -11,48 +13,84 @@ class OpenAIAdapter:
     def __init__(self, api_key: str = None, model: str = "gpt-4o-mini"):
         if not OPENAI_AVAILABLE:
             raise ImportError("openai package is not installed")
-        if api_key:
-            openai.api_key = api_key
-        # rely on environment variable OPENAI_API_KEY if not provided
+
+        self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self._legacy_client = None
+        self._v1_client = None
+
+        if hasattr(openai, "OpenAI"):
+            self._v1_client = openai.OpenAI(api_key=self._api_key)
+        else:
+            if self._api_key:
+                openai.api_key = self._api_key
+            self._legacy_client = openai
+
         self.model = model
 
-    def generate(self, prompt: str, context=None, max_tokens: int = 256, **kwargs) -> str:
+    @staticmethod
+    def _messages(prompt: str, context=None):
         messages = [{"role": "system", "content": "You are a helpful assistant."}]
         if context:
             messages.append({"role": "assistant", "content": "Context:\n" + "\n".join(context)})
         messages.append({"role": "user", "content": prompt})
-        resp = openai.ChatCompletion.create(model=self.model, messages=messages, max_tokens=max_tokens, **kwargs)
-        # best-effort parsing across SDK versions
-        try:
-            return resp["choices"][0]["message"]["content"]
-        except Exception:
-            try:
-                return resp.choices[0].message.content
-            except Exception:
-                return str(resp)
+        return messages
+
+    def generate(self, prompt: str, context=None, max_tokens: int = 256, **kwargs) -> str:
+        messages = self._messages(prompt, context=context)
+
+        if self._v1_client is not None:
+            resp = self._v1_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+            text = resp.choices[0].message.content
+            return text or ""
+
+        resp = self._legacy_client.ChatCompletion.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=max_tokens,
+            **kwargs,
+        )
+        return resp["choices"][0]["message"]["content"]
 
     def stream(self, prompt: str, context=None, **kwargs):
         """Yields text chunks from the OpenAI streaming API.
 
         Each yielded value is a str containing a fragment of generated text.
         """
-        messages = [{"role": "system", "content": "You are a helpful assistant."}]
-        if context:
-            messages.append({"role": "assistant", "content": "Context:\n" + "\n".join(context)})
-        messages.append({"role": "user", "content": prompt})
+        messages = self._messages(prompt, context=context)
 
-        for chunk in openai.ChatCompletion.create(model=self.model, messages=messages, stream=True, **kwargs):
-            # chunk is typically a dict with choices[].delta.content
-            try:
-                choices = chunk.get("choices", [])
-            except Exception:
-                choices = []
+        if self._v1_client is not None:
+            stream = self._v1_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                **kwargs,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                text = getattr(delta, "content", None)
+                if text:
+                    yield text
+            return
+
+        for chunk in self._legacy_client.ChatCompletion.create(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            **kwargs,
+        ):
+            choices = chunk.get("choices", [])
             for c in choices:
                 delta = c.get("delta", {})
                 text = delta.get("content")
                 if text:
                     yield text
-                # handle older SDK shapes
                 text2 = c.get("text")
                 if text2:
                     yield text2
