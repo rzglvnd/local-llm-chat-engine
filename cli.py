@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from .store import DocumentStore
+from store import DocumentStore
 
 
 def main():

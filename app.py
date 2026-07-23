@@ -1,15 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
-from .store import DocumentStore
-from .engine import EchoModel
+from store import DocumentStore
+from engine import EchoModel
 import os
 import json
 from fastapi.responses import StreamingResponse
 
 # embedding/FAISS optional backends
 try:
-    from .faiss_store import FaissStore
+    from faiss_store import FaissStore
     faiss_available = True
     try:
         faiss_store = FaissStore()
@@ -21,7 +21,7 @@ except Exception:
     faiss_available = False
 
 try:
-    from .embeddings import EmbeddingStore
+    from embeddings import EmbeddingStore
     embeddings_available = True
     embedding_store = None
     try:
@@ -35,14 +35,14 @@ except Exception:
 
 # model adapters
 try:
-    from .adapters.openai_adapter import OpenAIAdapter
+    from adapters.openai_adapter import OpenAIAdapter
     openai_adapter_available = True
 except Exception:
     OpenAIAdapter = None
     openai_adapter_available = False
 
 try:
-    from .adapters.huggingface_adapter import HuggingFaceAdapter
+    from adapters.huggingface_adapter import HuggingFaceAdapter
     hf_adapter_available = True
 except Exception:
     HuggingFaceAdapter = None
