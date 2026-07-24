@@ -11,6 +11,12 @@ Health checks
 - `GET /health` for liveness.
 - `GET /ready` for backend availability status.
 
+Rate limiting
+
+- Enable with `LOCAL_LLM_RATE_LIMIT_ENABLED=true`.
+- Tune throughput with `LOCAL_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE`.
+- Keep `/health` and `/ready` exempt (default behavior).
+
 Recommended startup sequence
 
 1. Start service.
@@ -24,6 +30,10 @@ Incident checklist
   - Check adapter availability (`/ready`).
   - Validate upstream key/env configuration.
   - Temporarily route traffic to `model=echo` if remote model is failing.
+- `429` spike:
+  - Review current caller traffic patterns.
+  - Increase request budget if legitimate traffic is being throttled.
+  - Ensure probes and internal callbacks use exempt endpoints where appropriate.
 - Empty retrieval results:
   - Confirm documents were ingested.
   - Check `k` values and query quality.

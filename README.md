@@ -61,7 +61,13 @@ You can start from `.env.example` and set required values.
 - `LOCAL_LLM_API_KEY` (optional; if set, required via `X-API-Key` on write endpoints)
 - `LOCAL_LLM_CORS_ORIGINS` (optional comma-separated list)
 - `LOCAL_LLM_SNAPSHOT_PATH` (default: `./data/store.pkl`)
+- `LOCAL_LLM_AUTOLOAD_SNAPSHOT` (default: `true`)
+- `LOCAL_LLM_FAIL_ON_SNAPSHOT_ERROR` (default: `false`)
 - `LOCAL_LLM_STREAM_CHUNK_SIZE` (default: `64`)
+- `LOCAL_LLM_RATE_LIMIT_ENABLED` (default: `false`)
+- `LOCAL_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE` (default: `120`)
+- `LOCAL_LLM_RATE_LIMIT_WINDOW_SECONDS` (default: `60`)
+- `LOCAL_LLM_RATE_LIMIT_EXEMPT_PATHS` (default: `/health,/ready`)
 
 ## API and docs
 

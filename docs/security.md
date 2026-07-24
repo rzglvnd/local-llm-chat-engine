@@ -23,4 +23,5 @@ Input validation
 Operational controls
 
 - Enable centralized logs and request IDs.
+- Enable in-service rate limiting via `LOCAL_LLM_RATE_LIMIT_*`.
 - Add WAF/rate-limits at ingress for internet-facing deployments.

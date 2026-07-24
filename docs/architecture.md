@@ -11,6 +11,7 @@ Core components
 	- Request validation and endpoint orchestration.
 	- Readiness and liveness endpoints.
 	- Optional API key guard for write operations.
+	- Configurable in-memory request throttling.
 - `store.py`
 	- TF-IDF retrieval backend with update semantics.
 	- Snapshot save/load support.
@@ -41,3 +42,4 @@ Design choices
 	dense retrieval/model packages are absent.
 - Configuration is environment-based for containerized deployments.
 - Snapshot endpoints make local and CI smoke testing reproducible.
+- Startup can autoload snapshots to recover retrieval state quickly.

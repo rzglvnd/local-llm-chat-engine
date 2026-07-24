@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app import app, store
+from rate_limit import InMemoryRateLimiter
 
 
 client = TestClient(app)
@@ -69,3 +70,25 @@ def test_snapshot_save_and_load(tmp_path) -> None:
 
     loaded_search = client.post("/search", json={"query": "stateful", "k": 3}).json()["results"]
     assert len(loaded_search) == 1
+
+
+def test_rate_limit_enforced_on_non_exempt_route() -> None:
+    original_limiter = app.state.rate_limiter
+    original_exempt = app.state.rate_limit_exempt_paths
+
+    app.state.rate_limiter = InMemoryRateLimiter(limit=1, window_seconds=60, enabled=True)
+    app.state.rate_limit_exempt_paths = {"/health", "/ready"}
+
+    try:
+        first = client.post("/search", json={"query": "hello", "k": 1})
+        assert first.status_code == 200
+
+        second = client.post("/search", json={"query": "hello", "k": 1})
+        assert second.status_code == 429
+        assert second.json()["detail"] == "Rate limit exceeded"
+
+        health = client.get("/health")
+        assert health.status_code == 200
+    finally:
+        app.state.rate_limiter = original_limiter
+        app.state.rate_limit_exempt_paths = original_exempt

@@ -7,10 +7,11 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from engine import EchoModel
+from rate_limit import InMemoryRateLimiter
 from settings import load_settings
 from store import DocumentStore
 
@@ -76,6 +77,38 @@ if settings.cors_origins:
 
 store = DocumentStore()
 model = EchoModel()
+
+app.state.rate_limiter = InMemoryRateLimiter(
+    limit=settings.rate_limit_requests_per_minute,
+    window_seconds=settings.rate_limit_window_seconds,
+    enabled=settings.rate_limit_enabled,
+)
+rate_limit_exempt_paths = set(settings.rate_limit_exempt_paths or [])
+rate_limit_exempt_paths.update({"/health", "/ready"})
+app.state.rate_limit_exempt_paths = rate_limit_exempt_paths
+
+
+@app.on_event("startup")
+async def startup_load_snapshot() -> None:
+    if not settings.autoload_snapshot:
+        return
+
+    snapshot_path = settings.snapshot_path
+    if not os.path.exists(snapshot_path):
+        logger.info("snapshot autoload skipped: file does not exist (%s)", snapshot_path)
+        return
+
+    try:
+        store.load(snapshot_path)
+        logger.info(
+            "snapshot autoloaded from %s with %s docs",
+            snapshot_path,
+            store.stats()["documents"],
+        )
+    except Exception:
+        logger.exception("snapshot autoload failed for %s", snapshot_path)
+        if settings.fail_on_snapshot_error:
+            raise
 
 
 def _model_dump(model_obj: BaseModel) -> Dict[str, Any]:
@@ -182,6 +215,18 @@ def _backend_status() -> Dict[str, Any]:
             "huggingface": hf_adapter_available,
             "echo": True,
         },
+        "runtime": {
+            "rate_limit": {
+                "enabled": app.state.rate_limiter.enabled,
+                "requests_per_minute": app.state.rate_limiter.limit,
+                "window_seconds": app.state.rate_limiter.window_seconds,
+                "exempt_paths": sorted(app.state.rate_limit_exempt_paths),
+            },
+            "snapshot": {
+                "path": settings.snapshot_path,
+                "autoload": settings.autoload_snapshot,
+            },
+        },
     }
 
 
@@ -197,8 +242,28 @@ def _safe_stream_text(text: str):
 async def attach_request_id_and_log(request: Request, call_next):
     request_id = request.headers.get("x-request-id", uuid4().hex)
     start = time.perf_counter()
+
+    rate_decision = None
+    response = None
+
+    limiter = app.state.rate_limiter
+    exempt_paths = app.state.rate_limit_exempt_paths
+    should_rate_limit = (
+        limiter.enabled
+        and request.method != "OPTIONS"
+        and request.url.path not in exempt_paths
+    )
+
+    if should_rate_limit:
+        client_host = request.client.host if request.client else "unknown"
+        rate_decision = limiter.check(client_host)
+        if not rate_decision.allowed:
+            response = JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+            response.headers["retry-after"] = str(rate_decision.reset_after_seconds)
+
     try:
-        response = await call_next(request)
+        if response is None:
+            response = await call_next(request)
     except Exception:
         logger.exception(
             "request_id=%s path=%s method=%s unhandled_error",
@@ -209,6 +274,12 @@ async def attach_request_id_and_log(request: Request, call_next):
         raise
 
     elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if should_rate_limit and rate_decision is not None:
+        response.headers["x-ratelimit-limit"] = str(limiter.limit)
+        response.headers["x-ratelimit-remaining"] = str(rate_decision.remaining)
+        response.headers["x-ratelimit-reset"] = str(rate_decision.reset_after_seconds)
+
     response.headers["x-request-id"] = request_id
     if settings.request_logging:
         logger.info(

@@ -14,6 +14,8 @@ Recommended environment variables in production:
 - `LOCAL_LLM_API_KEY` (required for write-protected environments)
 - `OPENAI_API_KEY` (if using OpenAI backend)
 - `LOCAL_LLM_SNAPSHOT_PATH` (point to persistent volume)
+- `LOCAL_LLM_AUTOLOAD_SNAPSHOT=true`
+- `LOCAL_LLM_RATE_LIMIT_ENABLED=true`
 - `LOCAL_LLM_LOG_LEVEL=INFO`
 
 ## Docker Compose

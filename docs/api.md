@@ -5,11 +5,19 @@ Base URL: `http://127.0.0.1:8001`
 Authentication
 
 - If `LOCAL_LLM_API_KEY` is set, write endpoints require `X-API-Key`.
+- If rate limiting is enabled, non-exempt routes may return `429`.
 
 Health
 
 - `GET /health` → liveness check.
 - `GET /ready` → backend readiness and optional dependency status.
+
+Rate limit headers (when enabled)
+
+- `x-ratelimit-limit`
+- `x-ratelimit-remaining`
+- `x-ratelimit-reset`
+- `retry-after` (on `429`)
 
 Ingestion
 
