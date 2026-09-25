@@ -1,7 +1,25 @@
 # Local LLM Chat Engine
 
-Mission
-> Build a production-ready local AI assistant with API, CLI, Docker, RAG, and plugin support.
+A production-oriented Python RAG backend connecting document ingestion and retrieval to interchangeable local or hosted model adapters. It includes an API, CLI, tests, and Docker packaging; it is not a claim of production readiness.
+
+## Problem and architecture
+
+Retrieval experiments become difficult to maintain when ingestion, indexing, model calls, and API behavior are coupled. This project separates those responsibilities so each backend can be inspected and replaced.
+
+```mermaid
+flowchart LR
+  A[Normalized documents] --> B[Ingestion]
+  B --> C[TF-IDF or optional embeddings / FAISS]
+  Q[API / CLI query] --> C
+  C --> D[Retrieved context]
+  D --> E[Echo / OpenAI / Hugging Face adapter]
+  E --> F[Response / SSE chunks]
+  C -. TF-IDF only .-> S[Snapshot save / load]
+```
+
+**Design choices:** TF-IDF provides a lightweight baseline; optional dense retrieval adds dependencies and model downloads. Model adapters isolate generation from retrieval. The root modules are the application implementation; the `local_llm_chat_engine/` package exposes compatibility imports.
+
+**Stack:** Python, FastAPI, scikit-learn, optional sentence-transformers/FAISS and model SDKs, pytest, Docker.
 
 ## What this service provides
 
@@ -96,10 +114,27 @@ python cli.py load --path ./data/store.pkl
 
 ```bash
 python -m pip install -r requirements.txt
-pytest -q
-flake8 .
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+python -m flake8 .
 ```
 
 CI runs on push/PR and executes lint + tests on Python 3.10 and 3.11.
 
 
+
+## Evaluation, limitations, and roadmap
+
+Tests exercise retrieval, adapters, API behavior, and rate limiting. They do not establish answer quality, safety, load capacity, or production SLOs. The echo adapter makes smoke tests independent of model credentials.
+
+- TF-IDF ingestion rebuilds the index; the baseline is intended for small datasets.
+- Snapshot persistence covers TF-IDF state, not a durable FAISS database. Only load trusted pickle snapshots.
+- OpenAI can stream native tokens; Hugging Face output is chunked after generation.
+- Dense retrieval and real model integrations require optional dependencies and separate validation.
+- Optional API keys and in-memory rate limits are not multi-tenant authorization.
+
+See [architecture](docs/architecture.md), [operations](docs/operations.md), [security](docs/security.md), and [roadmap](docs/roadmap.md). Async inference/background ingestion, metrics/tracing, pluggable storage, and multi-tenant authorization remain roadmap work.
+
+## License
+
+See [LICENSE](LICENSE) for the repository license.
