@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -197,6 +198,11 @@ def _resolve_adapter(model_name: str):
     raise HTTPException(status_code=400, detail=f"Unsupported model '{model_name}'")
 
 
+def _generate_chat_response(model_name: str, prompt: str, contexts: List[str]) -> str:
+    adapter = _resolve_adapter(model_name)
+    return adapter.generate(prompt, context=contexts)
+
+
 def _backend_status() -> Dict[str, Any]:
     return {
         "stores": {
@@ -358,8 +364,7 @@ async def chat(req: ChatRequest):
     query = req.message
     k = _sanitize_k(req.k)
     contexts = [r["text"] for r in store.search(query, k=k)]
-    adapter = _resolve_adapter(req.model)
-    resp = adapter.generate(query, context=contexts)
+    resp = await run_in_threadpool(_generate_chat_response, req.model, query, contexts)
     return {"model": req.model, "response": resp, "context_count": len(contexts)}
 
 
