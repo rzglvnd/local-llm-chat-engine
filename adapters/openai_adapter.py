@@ -1,4 +1,5 @@
 """OpenAI adapter with optional streaming support."""
+import logging
 import os
 
 try:
@@ -7,6 +8,19 @@ try:
 except Exception:
     openai = None
     OPENAI_AVAILABLE = False
+
+
+logger = logging.getLogger(__name__)
+
+
+def _close_stream(stream) -> None:
+    try:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        # Cleanup must not replace a provider error or a completed response.
+        logger.exception("Failed to close provider stream")
 
 
 class OpenAIAdapter:
@@ -60,6 +74,7 @@ class OpenAIAdapter:
         """Yields text chunks from the OpenAI streaming API.
 
         Each yielded value is a str containing a fragment of generated text.
+        Close this generator explicitly if consuming only part of its output.
         """
         messages = self._messages(prompt, context=context)
 
@@ -70,29 +85,36 @@ class OpenAIAdapter:
                 stream=True,
                 **kwargs,
             )
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                text = getattr(delta, "content", None)
-                if text:
-                    yield text
+            try:
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    text = getattr(delta, "content", None)
+                    if text:
+                        yield text
+            finally:
+                _close_stream(stream)
             return
 
-        for chunk in self._legacy_client.ChatCompletion.create(
+        stream = self._legacy_client.ChatCompletion.create(
             model=self.model,
             messages=messages,
             stream=True,
             **kwargs,
-        ):
-            choices = chunk.get("choices", [])
-            for c in choices:
-                delta = c.get("delta", {})
-                text = delta.get("content")
-                if text:
-                    yield text
-                text2 = c.get("text")
-                if text2:
-                    yield text2
-                if c.get("finish_reason"):
-                    return
+        )
+        try:
+            for chunk in stream:
+                choices = chunk.get("choices", [])
+                for c in choices:
+                    delta = c.get("delta", {})
+                    text = delta.get("content")
+                    if text:
+                        yield text
+                    text2 = c.get("text")
+                    if text2:
+                        yield text2
+                    if c.get("finish_reason"):
+                        return
+        finally:
+            _close_stream(stream)
