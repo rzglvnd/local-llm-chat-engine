@@ -39,8 +39,7 @@ The framework's shared worker capacity is finite, so calls can queue under load.
 Offloading does not impose a provider timeout or forcibly stop a running thread
 on cancellation. Retrieval remains synchronous on the event loop; this test does
 not establish responsiveness during slow retrieval or CPU-heavy inference.
-Provider timeouts, SDK client cleanup, and `/chat_stream` lifecycle behavior need
-separate work.
+Provider timeouts and SDK client cleanup remain separate work.
 
 ## Streaming response ownership
 
@@ -65,13 +64,41 @@ with closing(adapter.stream("Explain retrieval")) as chunks:
 A `for` loop's `break` alone does not promise iterator cleanup. Closing a
 partially consumed adapter generator runs its `finally` block; closing an
 unstarted generator does not acquire a provider response. Response cleanup does
-not close the reusable SDK client. Client ownership and `/chat_stream` disconnect
-handling remain separate work: this change does not guarantee that an HTTP
-disconnect closes the adapter generator or interrupts a blocked provider read.
+not close the reusable SDK client; client ownership remains separate work.
 
 `tests/test_openai_stream_cleanup.py` uses fake SDKs and response iterators to
 check cleanup, unchanged chunks and request arguments, error propagation, and
 client ownership. It needs no credentials, SDK installation, or network access.
+
+## HTTP streaming teardown
+
+`/chat_stream` now owns both layers of iteration: the response closes its SSE
+generator, whose `finally` closes the adapter iterator when it supports `close()`.
+This runs after completion, iteration failure, send failure, or framework
+disconnect/cancellation teardown. Successful responses retain the SSE `start`,
+`chunk`, and `done` events. Failed or interrupted streams do not manufacture a
+`done` event. Cleanup failures are logged without replacing the original result.
+
+The response serializes synchronous reads and closure with a lock. Both run in
+framework worker threads, so cleanup can wait for an active read without blocking
+the event loop or closing a generator while it is executing. An AnyIO cancellation
+shield lets finalization run even inside a cancelled scope. AnyIO is an explicit
+core dependency because this finalization uses its public cancellation API.
+
+Cancellation does not kill a worker thread. A blocked provider read must return
+before closure can proceed, and a slow `close()` can also delay teardown. There
+is no hard shutdown deadline, thread affinity, or guarantee after process
+termination or repeated direct task cancellation. Worker capacity remains shared
+and finite. Streaming adapter initialization and retrieval still execute
+synchronously in the endpoint; this change only addresses response ownership.
+
+`tests/test_chat_stream_cleanup.py` drives ASGI receive/send directly for both
+receive-disconnect and send-error paths, and also checks the full application
+with its request middleware. Retained iterators expose missing cleanup without
+relying on garbage collection. Event-gated reads check AnyIO scope cancellation,
+asyncio task cancellation, and a concurrent `/health` request before releasing the
+worker. Echo fallback and iterators without `close` remain covered. These tests
+use fake adapters and require no provider credentials or network access.
 
 Configuration
 

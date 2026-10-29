@@ -2,9 +2,11 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Literal, Optional
+from threading import Lock
+from typing import Any, Dict, Iterator, List, Literal, Optional
 from uuid import uuid4
 
+from anyio import CancelScope
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -373,6 +375,52 @@ def _sse_encode(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
+def _close_chat_stream(iterator) -> None:
+    try:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.exception("Failed to close chat adapter stream")
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Own a synchronous SSE iterator through response teardown."""
+
+    def __init__(self, content: Iterator[str]):
+        self._content = content
+        self._iteration_lock = Lock()
+        self._closed = False
+        super().__init__(self._locked_content(), media_type="text/event-stream")
+
+    def _locked_content(self):
+        while True:
+            with self._iteration_lock:
+                if self._closed:
+                    return
+                try:
+                    chunk = next(self._content)
+                except StopIteration:
+                    return
+            yield chunk
+
+    def _close_content(self) -> None:
+        # A cancelled await may leave its worker running. Never close a
+        # generator concurrently with next(), even in that case.
+        with self._iteration_lock:
+            if not self._closed:
+                self._closed = True
+                _close_chat_stream(self._content)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Finalization must survive an already-cancelled AnyIO scope.
+            with CancelScope(shield=True):
+                await run_in_threadpool(self._close_content)
+
+
 @app.post("/chat_stream")
 async def chat_stream(payload: ChatRequest):
     message = payload.message
@@ -388,9 +436,13 @@ async def chat_stream(payload: ChatRequest):
         yield _sse_encode({"event": "start", "model": model_name})
         # adapter may be an EchoModel with no stream() method
         if hasattr(adapter, "stream"):
-            for chunk in adapter.stream(message, context=contexts):
-                if chunk:
-                    yield _sse_encode({"event": "chunk", "text": chunk})
+            chunks = adapter.stream(message, context=contexts)
+            try:
+                for chunk in chunks:
+                    if chunk:
+                        yield _sse_encode({"event": "chunk", "text": chunk})
+            finally:
+                _close_chat_stream(chunks)
         else:
             # fallback to generate then stream in chunks
             text = adapter.generate(message, context=contexts)
@@ -398,7 +450,7 @@ async def chat_stream(payload: ChatRequest):
                 yield _sse_encode({"event": "chunk", "text": chunk})
         yield _sse_encode({"event": "done"})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return _ClosingStreamingResponse(event_stream())
 
 
 @app.post("/snapshot/save")
