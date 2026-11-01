@@ -70,6 +70,19 @@ not close the reusable SDK client; client ownership remains separate work.
 check cleanup, unchanged chunks and request arguments, error propagation, and
 client ownership. It needs no credentials, SDK installation, or network access.
 
+## Streaming initialization
+
+`/chat_stream` awaits adapter construction in the framework thread pool before
+returning its SSE response. Blocking model or client initialization therefore
+does not run directly on the event loop. Unavailable adapters and constructor
+failures still return HTTP 400 JSON before any streaming headers are sent.
+
+`tests/test_chat_concurrency.py` checks that `/health` responds while fake
+initialization is gated by an event, before the fake constructor is released.
+It also checks SSE output and context forwarding; initialization error cases
+cover both adapter backends. The tests require no provider credentials or model
+downloads. Offloading uses shared worker capacity and adds no hard timeout.
+
 ## HTTP streaming teardown
 
 `/chat_stream` now owns both layers of iteration: the response closes its SSE
@@ -89,8 +102,8 @@ Cancellation does not kill a worker thread. A blocked provider read must return
 before closure can proceed, and a slow `close()` can also delay teardown. There
 is no hard shutdown deadline, thread affinity, or guarantee after process
 termination or repeated direct task cancellation. Worker capacity remains shared
-and finite. Streaming adapter initialization and retrieval still execute
-synchronously in the endpoint; this change only addresses response ownership.
+and finite. Retrieval still executes synchronously in the endpoint; the response
+ownership mechanism does not offload retrieval or impose provider timeouts.
 
 `tests/test_chat_stream_cleanup.py` drives ASGI receive/send directly for both
 receive-disconnect and send-error paths, and also checks the full application

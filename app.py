@@ -427,7 +427,7 @@ async def chat_stream(payload: ChatRequest):
     model_name = payload.model
     k = _sanitize_k(payload.k)
 
-    adapter = _resolve_adapter(model_name)
+    adapter = await run_in_threadpool(_resolve_adapter, model_name)
 
     # get context from store
     contexts = [r["text"] for r in store.search(message, k=k)]
