@@ -202,7 +202,17 @@ def _resolve_adapter(model_name: str):
 
 def _generate_chat_response(model_name: str, prompt: str, contexts: List[str]) -> str:
     adapter = _resolve_adapter(model_name)
-    return adapter.generate(prompt, context=contexts)
+    try:
+        return adapter.generate(prompt, context=contexts)
+    finally:
+        # Only the OpenAI adapter owns an SDK client in this request path.
+        if model_name == "openai":
+            try:
+                close = getattr(adapter, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                logger.exception("Failed to close chat adapter client")
 
 
 def _backend_status() -> Dict[str, Any]:

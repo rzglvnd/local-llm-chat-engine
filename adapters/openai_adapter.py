@@ -31,6 +31,7 @@ class OpenAIAdapter:
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self._legacy_client = None
         self._v1_client = None
+        self._closed = False
 
         if hasattr(openai, "OpenAI"):
             self._v1_client = openai.OpenAI(api_key=self._api_key)
@@ -41,6 +42,15 @@ class OpenAIAdapter:
 
         self.model = model
 
+    def close(self) -> None:
+        """Release this adapter's owned client after active work has finished."""
+        if self._closed:
+            return
+        # A failed close is still terminal; never reuse a partly closed client.
+        self._closed = True
+        if self._v1_client is not None:
+            self._v1_client.close()
+
     @staticmethod
     def _messages(prompt: str, context=None):
         messages = [{"role": "system", "content": "You are a helpful assistant."}]
@@ -50,6 +60,8 @@ class OpenAIAdapter:
         return messages
 
     def generate(self, prompt: str, context=None, max_tokens: int = 256, **kwargs) -> str:
+        if self._closed:
+            raise RuntimeError("OpenAI adapter is closed")
         messages = self._messages(prompt, context=context)
 
         if self._v1_client is not None:
@@ -76,6 +88,8 @@ class OpenAIAdapter:
         Each yielded value is a str containing a fragment of generated text.
         Close this generator explicitly if consuming only part of its output.
         """
+        if self._closed:
+            raise RuntimeError("OpenAI adapter is closed")
         messages = self._messages(prompt, context=context)
 
         if self._v1_client is not None:

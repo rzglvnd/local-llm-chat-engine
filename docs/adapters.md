@@ -39,7 +39,34 @@ The framework's shared worker capacity is finite, so calls can queue under load.
 Offloading does not impose a provider timeout or forcibly stop a running thread
 on cancellation. Retrieval remains synchronous on the event loop; this test does
 not establish responsiveness during slow retrieval or CPU-heavy inference.
-Provider timeouts and SDK client cleanup remain separate work.
+Provider timeouts remain separate work.
+
+## Non-streaming client ownership
+
+The modern `OpenAIAdapter` constructs and owns its SDK client. Its `close()`
+attempts client closure once; repeated calls do nothing. Closure is terminal even
+if the SDK raises: new `generate()` calls and starting `stream()` iteration raise
+`RuntimeError`. Direct callers receive SDK close errors and must finish active
+generation and close any active stream before closing the adapter. This is a
+sequential ownership contract, not a concurrent close/cancel API.
+
+`/chat` runs adapter construction, generation, and a `finally` cleanup in one
+worker operation. Cleanup follows success or generation failure, so it also runs
+if the awaiting request has stopped waiting but the worker later finishes.
+Cleanup exceptions are logged without changing successful output or replacing
+the original generation error. A failed close is not retried and does not prove
+the underlying resources were released. Blocking generation or closure can delay
+worker completion; no hard cleanup deadline is introduced.
+
+The legacy adapter borrows the SDK module; `close()` marks the adapter closed
+without closing that shared module. `/chat` leaves the shared echo model and the
+Hugging Face adapter outside this SDK cleanup path. Streaming response cleanup
+still owns only the response iterator: automatic SDK client cleanup for
+`/chat_stream` remains separate work.
+
+`tests/test_openai_client_cleanup.py` uses fake SDKs to check worker ordering,
+success/failure cleanup, idempotence, closed-state behavior, cleanup errors, and
+borrowed resources. It requires no credentials, SDK installation, or network.
 
 ## Streaming response ownership
 
@@ -64,7 +91,9 @@ with closing(adapter.stream("Explain retrieval")) as chunks:
 A `for` loop's `break` alone does not promise iterator cleanup. Closing a
 partially consumed adapter generator runs its `finally` block; closing an
 unstarted generator does not acquire a provider response. Response cleanup does
-not close the reusable SDK client; client ownership remains separate work.
+not close the reusable SDK client. Automatic client cleanup in `/chat_stream`
+remains separate work; direct adapter callers must close the client after its
+active streams have finished or been closed.
 
 `tests/test_openai_stream_cleanup.py` uses fake SDKs and response iterators to
 check cleanup, unchanged chunks and request arguments, error propagation, and
