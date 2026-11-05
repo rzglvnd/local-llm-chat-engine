@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from threading import Lock
-from typing import Any, Dict, Iterator, List, Literal, Optional
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional
 from uuid import uuid4
 
 from anyio import CancelScope
@@ -200,6 +200,40 @@ def _resolve_adapter(model_name: str):
     raise HTTPException(status_code=400, detail=f"Unsupported model '{model_name}'")
 
 
+def _close_chat_adapter_client(adapter) -> None:
+    try:
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.exception("Failed to close chat adapter client")
+
+
+class _StreamingAdapterOwner:
+    """Retain ownership even if setup stops awaiting the construction worker."""
+
+    def __init__(self, model_name: str):
+        self._model_name = model_name
+        self._adapter = None
+        self._lock = Lock()
+        self._closed = False
+
+    def initialize(self):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Streaming adapter setup has been closed")
+            self._adapter = _resolve_adapter(self._model_name)
+            return self._adapter
+
+    def close(self) -> None:
+        # Wait for construction to publish its result before releasing it.
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                if self._model_name == "openai" and self._adapter is not None:
+                    _close_chat_adapter_client(self._adapter)
+
+
 def _generate_chat_response(model_name: str, prompt: str, contexts: List[str]) -> str:
     adapter = _resolve_adapter(model_name)
     try:
@@ -207,12 +241,7 @@ def _generate_chat_response(model_name: str, prompt: str, contexts: List[str]) -
     finally:
         # Only the OpenAI adapter owns an SDK client in this request path.
         if model_name == "openai":
-            try:
-                close = getattr(adapter, "close", None)
-                if callable(close):
-                    close()
-            except Exception:
-                logger.exception("Failed to close chat adapter client")
+            _close_chat_adapter_client(adapter)
 
 
 def _backend_status() -> Dict[str, Any]:
@@ -397,8 +426,9 @@ def _close_chat_stream(iterator) -> None:
 class _ClosingStreamingResponse(StreamingResponse):
     """Own a synchronous SSE iterator through response teardown."""
 
-    def __init__(self, content: Iterator[str]):
+    def __init__(self, content: Iterator[str], on_close: Optional[Callable[[], None]] = None):
         self._content = content
+        self._on_close = on_close
         self._iteration_lock = Lock()
         self._closed = False
         super().__init__(self._locked_content(), media_type="text/event-stream")
@@ -420,7 +450,11 @@ class _ClosingStreamingResponse(StreamingResponse):
         with self._iteration_lock:
             if not self._closed:
                 self._closed = True
-                _close_chat_stream(self._content)
+                try:
+                    _close_chat_stream(self._content)
+                finally:
+                    if self._on_close is not None:
+                        self._on_close()
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -437,30 +471,37 @@ async def chat_stream(payload: ChatRequest):
     model_name = payload.model
     k = _sanitize_k(payload.k)
 
-    adapter = await run_in_threadpool(_resolve_adapter, model_name)
+    owner = _StreamingAdapterOwner(model_name)
+    try:
+        adapter = await run_in_threadpool(owner.initialize)
 
-    # get context from store
-    contexts = [r["text"] for r in store.search(message, k=k)]
+        # get context from store
+        contexts = [r["text"] for r in store.search(message, k=k)]
 
-    def event_stream():
-        yield _sse_encode({"event": "start", "model": model_name})
-        # adapter may be an EchoModel with no stream() method
-        if hasattr(adapter, "stream"):
-            chunks = adapter.stream(message, context=contexts)
-            try:
-                for chunk in chunks:
-                    if chunk:
-                        yield _sse_encode({"event": "chunk", "text": chunk})
-            finally:
-                _close_chat_stream(chunks)
-        else:
-            # fallback to generate then stream in chunks
-            text = adapter.generate(message, context=contexts)
-            for chunk in _safe_stream_text(text):
-                yield _sse_encode({"event": "chunk", "text": chunk})
-        yield _sse_encode({"event": "done"})
+        def event_stream():
+            yield _sse_encode({"event": "start", "model": model_name})
+            # adapter may be an EchoModel with no stream() method
+            if hasattr(adapter, "stream"):
+                chunks = adapter.stream(message, context=contexts)
+                try:
+                    for chunk in chunks:
+                        if chunk:
+                            yield _sse_encode({"event": "chunk", "text": chunk})
+                finally:
+                    _close_chat_stream(chunks)
+            else:
+                # fallback to generate then stream in chunks
+                text = adapter.generate(message, context=contexts)
+                for chunk in _safe_stream_text(text):
+                    yield _sse_encode({"event": "chunk", "text": chunk})
+            yield _sse_encode({"event": "done"})
 
-    return _ClosingStreamingResponse(event_stream())
+        return _ClosingStreamingResponse(event_stream(), on_close=owner.close)
+    except BaseException:
+        # Ownership transfers only after the response is constructed.
+        with CancelScope(shield=True):
+            await run_in_threadpool(owner.close)
+        raise
 
 
 @app.post("/snapshot/save")

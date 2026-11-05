@@ -17,6 +17,9 @@ class TrackedStream:
         self.close_thread = None
         self.close_error = None
         self.reading = False
+        self.teardown = []
+        self.client_close_error = None
+        self.client_close_thread = None
 
     def __iter__(self):
         return self
@@ -30,19 +33,30 @@ class TrackedStream:
     def close(self):
         assert not self.reading, "close raced with an active provider read"
         self.close_calls += 1
+        self.teardown.append("stream")
         self.close_thread = threading.get_ident()
         if self.close_error:
             raise self.close_error
 
+    def close_client(self):
+        assert not self.reading, "client close raced with a provider read"
+        self.teardown.append("client")
+        self.client_close_thread = threading.get_ident()
+        if self.client_close_error:
+            raise self.client_close_error
 
-def configure_stream(monkeypatch, source):
+
+def configure_stream(monkeypatch, source, close_client=None):
     calls = []
 
     def stream(message, context):
         calls.append((message, context))
         return source
 
-    monkeypatch.setattr(api, "_resolve_adapter", lambda name: SimpleNamespace(stream=stream))
+    adapter = SimpleNamespace(stream=stream)
+    if close_client is not None:
+        adapter.close = close_client
+    monkeypatch.setattr(api, "_resolve_adapter", lambda name: adapter)
     monkeypatch.setattr(api.store, "search", lambda query, k: [{"text": "context"}])
     return calls
 
@@ -68,7 +82,7 @@ def test_stream_response_teardown_closes_adapter(monkeypatch, spec_version, endi
     failure = RuntimeError("provider failed")
     send_failure = OSError("client connection closed")
     source = TrackedStream(["one", failure if ending == "iteration_error" else "two"])
-    calls = configure_stream(monkeypatch, source)
+    calls = configure_stream(monkeypatch, source, source.close_client)
 
     async def scenario():
         loop_thread = threading.get_ident()
@@ -108,6 +122,8 @@ def test_stream_response_teardown_closes_adapter(monkeypatch, spec_version, endi
 
         assert source.close_calls == 1
         assert source.close_thread != loop_thread
+        assert source.teardown == ["stream", "client"]
+        assert source.client_close_thread != loop_thread
         assert calls == [("question", ["context"])]
         assert events[:2] == [
             {"event": "start", "model": "openai"}, {"event": "chunk", "text": "one"}
@@ -143,7 +159,7 @@ def test_cancellation_waits_for_active_read_without_blocking_event_loop(monkeypa
                     self.reading = False
 
         source = BlockingStream(["one"])
-        configure_stream(monkeypatch, source)
+        configure_stream(monkeypatch, source, source.close_client)
         response = await api.chat_stream(api.ChatRequest(message="question", model="openai"))
         cancel_scope = anyio.CancelScope()
 
@@ -172,6 +188,7 @@ def test_cancellation_waits_for_active_read_without_blocking_event_loop(monkeypa
             assert not watchdog_expired.is_set()
             assert source.reading
             assert source.close_calls == 0
+            assert source.teardown == []
             assert not task.done()
         finally:
             release.set()
@@ -183,6 +200,8 @@ def test_cancellation_waits_for_active_read_without_blocking_event_loop(monkeypa
         assert source.close_calls == 1
         assert source.close_thread != loop_thread
         assert not source.reading
+        assert source.teardown == ["stream", "client"]
+        assert source.client_close_thread != loop_thread
 
     anyio.run(scenario)
 
@@ -192,7 +211,8 @@ def test_adapter_cleanup_failure_preserves_result(monkeypatch, caplog, iteration
     failure = RuntimeError("provider failed")
     source = TrackedStream([failure] if iteration_fails else ["one"])
     source.close_error = OSError("close failed")
-    configure_stream(monkeypatch, source)
+    source.client_close_error = OSError("client close failed")
+    configure_stream(monkeypatch, source, source.close_client)
 
     async def scenario():
         response = await api.chat_stream(api.ChatRequest(message="question", model="openai"))
@@ -211,6 +231,8 @@ def test_adapter_cleanup_failure_preserves_result(monkeypatch, caplog, iteration
             await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
         assert source.close_calls == 1
         assert "Failed to close chat adapter stream" in caplog.text
+        assert "Failed to close chat adapter client" in caplog.text
+        assert source.teardown == ["stream", "client"]
 
     anyio.run(scenario)
 
@@ -218,7 +240,7 @@ def test_adapter_cleanup_failure_preserves_result(monkeypatch, caplog, iteration
 @pytest.mark.parametrize("ending", ["complete", "send_failure", "disconnect"])
 def test_stream_cleanup_through_application_middleware(monkeypatch, ending):
     source = TrackedStream(["one"] * (2 if ending == "complete" else 1000))
-    configure_stream(monkeypatch, source)
+    configure_stream(monkeypatch, source, source.close_client)
 
     async def scenario():
         request_sent = False
@@ -266,6 +288,7 @@ def test_stream_cleanup_through_application_middleware(monkeypatch, ending):
             else:
                 await api.app(scope, receive, send)
         assert source.close_calls == 1
+        assert source.teardown == ["stream", "client"]
         if ending == "complete":
             assert [event["event"] for event in events] == ["start", "chunk", "chunk", "done"]
         else:
@@ -293,5 +316,121 @@ def test_streaming_fallbacks_remain_compatible(monkeypatch, backend):
             assert text == "one"
         else:
             assert "question" in text
+
+    anyio.run(scenario)
+
+
+@pytest.mark.parametrize("failure_point", ["headers", "start_event"])
+def test_client_cleanup_before_adapter_stream_is_started(monkeypatch, failure_point):
+    source = TrackedStream(["one"])
+    calls = configure_stream(monkeypatch, source, source.close_client)
+    failure = OSError("connection closed before tokens")
+
+    async def scenario():
+        loop_thread = threading.get_ident()
+        response = await api.chat_stream(api.ChatRequest(message="question", model="openai"))
+
+        async def receive():
+            await anyio.sleep_forever()
+
+        async def send(message):
+            if failure_point == "headers" or message["type"] == "http.response.body":
+                raise failure
+
+        with pytest.raises(Exception) as raised:
+            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+        assert exception_contains(raised.value, failure)
+        assert calls == []
+        assert source.teardown == ["client"]
+        assert source.client_close_thread != loop_thread
+
+    anyio.run(scenario)
+
+
+@pytest.mark.parametrize("failure_point", ["retrieval", "response_creation"])
+def test_setup_failure_closes_acquired_client(monkeypatch, failure_point):
+    source = TrackedStream(["one"])
+    calls = configure_stream(monkeypatch, source, source.close_client)
+    source.client_close_error = OSError("client close failed")
+    failure = RuntimeError("stream setup failed")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    if failure_point == "retrieval":
+        monkeypatch.setattr(api.store, "search", fail)
+    else:
+        monkeypatch.setattr(api, "_ClosingStreamingResponse", fail)
+
+    async def scenario():
+        loop_thread = threading.get_ident()
+        with pytest.raises(RuntimeError) as raised:
+            await api.chat_stream(api.ChatRequest(message="question", model="openai"))
+        assert raised.value is failure
+        assert calls == []
+        assert source.teardown == ["client"]
+        assert source.client_close_thread != loop_thread
+
+    anyio.run(scenario)
+
+
+@pytest.mark.parametrize("cancellation", ["scope", "task"])
+def test_cancelled_construction_closes_client_after_constructor_returns(monkeypatch, cancellation):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        entered = asyncio.Event()
+        release = threading.Event()
+        watchdog_expired = threading.Event()
+        source = TrackedStream(["one"])
+        calls = configure_stream(monkeypatch, source, source.close_client)
+        resolve = api._resolve_adapter
+
+        def blocked_resolve(name):
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(timeout=5):
+                watchdog_expired.set()
+            return resolve(name)
+
+        monkeypatch.setattr(api, "_resolve_adapter", blocked_resolve)
+        cancel_scope = anyio.CancelScope()
+
+        async def receive():
+            await anyio.sleep_forever()
+
+        async def send(message):
+            await anyio.lowlevel.checkpoint()
+
+        async def invoke():
+            with cancel_scope:
+                response = await api.chat_stream(api.ChatRequest(
+                    message="question", model="openai"
+                ))
+                await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+        task = asyncio.create_task(invoke())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            if cancellation == "scope":
+                cancel_scope.cancel()
+            else:
+                task.cancel()
+            transport = httpx.ASGITransport(app=api.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                health = await asyncio.wait_for(client.get("/health"), timeout=5)
+            assert health.status_code == 200
+            assert not watchdog_expired.is_set()
+            assert source.teardown == []
+            assert not task.done()
+        finally:
+            release.set()
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+        assert calls == []
+        assert source.teardown == ["client"]
+        assert source.client_close_thread != loop_thread
+        if cancellation == "task":
+            assert isinstance(result[0], asyncio.CancelledError)
+        else:
+            assert result == [None]
 
     anyio.run(scenario)

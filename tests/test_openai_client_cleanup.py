@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -17,9 +18,23 @@ def provider(request, monkeypatch):
         state.calls.append((event, threading.get_ident()))
 
     def create(**kwargs):
-        record("generate")
+        record("stream" if kwargs.get("stream") else "generate")
         if state.generation_error:
             raise state.generation_error
+        if kwargs.get("stream"):
+            def chunks():
+                try:
+                    if state.kind == "modern":
+                        yield SimpleNamespace(choices=[SimpleNamespace(
+                            delta=SimpleNamespace(content="fake answer")
+                        )])
+                    else:
+                        yield {"choices": [{"delta": {"content": "fake answer"}}]}
+                finally:
+                    record("close_stream")
+
+            state.response = chunks()
+            return state.response
         if state.kind == "modern":
             return SimpleNamespace(choices=[SimpleNamespace(
                 message=SimpleNamespace(content="fake answer")
@@ -131,8 +146,44 @@ def test_failed_close_is_attempted_once_and_leaves_adapter_closed(provider):
     assert [event for event, _ in provider.calls] == ["initialize", "close"]
 
 
-def test_chat_never_closes_shared_echo_model(monkeypatch):
+@pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
+def test_chat_never_closes_shared_echo_model(monkeypatch, path):
     calls = []
     monkeypatch.setattr(api.model, "close", lambda: calls.append("close"), raising=False)
-    assert "question" in api._generate_chat_response("echo", "question", [])
-    assert calls == []
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(path, json={"message": "question", "model": "echo"})
+        assert response.status_code == 200
+        assert "question" in response.text
+        assert calls == []
+
+    asyncio.run(scenario())
+
+
+def test_streaming_request_closes_response_before_owned_sdk_client(provider):
+    async def scenario():
+        loop_thread = threading.get_ident()
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/chat_stream", json={"message": "question", "model": "openai"}
+            )
+        assert response.status_code == 200
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith("data: ")]
+        assert events == [
+            {"event": "start", "model": "openai"},
+            {"event": "chunk", "text": "fake answer"},
+            {"event": "done"},
+        ]
+        expected = ["initialize", "stream", "close_stream"]
+        if provider.kind == "modern":
+            expected.append("close")
+        assert [event for event, _ in provider.calls] == expected
+        assert all(thread != loop_thread for _, thread in provider.calls)
+        # Retain the provider iterator through the assertions.
+        assert provider.response is not None
+
+    asyncio.run(scenario())

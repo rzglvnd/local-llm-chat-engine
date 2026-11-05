@@ -41,7 +41,7 @@ on cancellation. Retrieval remains synchronous on the event loop; this test does
 not establish responsiveness during slow retrieval or CPU-heavy inference.
 Provider timeouts remain separate work.
 
-## Non-streaming client ownership
+## SDK client ownership
 
 The modern `OpenAIAdapter` constructs and owns its SDK client. Its `close()`
 attempts client closure once; repeated calls do nothing. Closure is terminal even
@@ -59,10 +59,9 @@ the underlying resources were released. Blocking generation or closure can delay
 worker completion; no hard cleanup deadline is introduced.
 
 The legacy adapter borrows the SDK module; `close()` marks the adapter closed
-without closing that shared module. `/chat` leaves the shared echo model and the
-Hugging Face adapter outside this SDK cleanup path. Streaming response cleanup
-still owns only the response iterator: automatic SDK client cleanup for
-`/chat_stream` remains separate work.
+without closing that shared module. Both endpoints leave the shared echo model
+and the Hugging Face adapter outside this SDK cleanup path. `/chat_stream`
+transfers its client ownership to the response as described below.
 
 `tests/test_openai_client_cleanup.py` uses fake SDKs to check worker ordering,
 success/failure cleanup, idempotence, closed-state behavior, cleanup errors, and
@@ -90,10 +89,10 @@ with closing(adapter.stream("Explain retrieval")) as chunks:
 
 A `for` loop's `break` alone does not promise iterator cleanup. Closing a
 partially consumed adapter generator runs its `finally` block; closing an
-unstarted generator does not acquire a provider response. Response cleanup does
-not close the reusable SDK client. Automatic client cleanup in `/chat_stream`
-remains separate work; direct adapter callers must close the client after its
-active streams have finished or been closed.
+unstarted generator does not acquire a provider response. Closing this adapter
+generator alone does not close the SDK client. `/chat_stream` handles that client
+separately during response teardown; direct adapter callers must close it after
+its active streams have finished or been closed.
 
 `tests/test_openai_stream_cleanup.py` uses fake SDKs and response iterators to
 check cleanup, unchanged chunks and request arguments, error propagation, and
@@ -102,7 +101,10 @@ client ownership. It needs no credentials, SDK installation, or network access.
 ## Streaming initialization
 
 `/chat_stream` awaits adapter construction in the framework thread pool before
-returning its SSE response. Blocking model or client initialization therefore
+returning its SSE response. A request owner retains the constructor's result
+even if the request stops awaiting its worker. Construction and owner cleanup
+share a lock: cleanup waits for construction to finish, or prevents it from
+starting if the owner was already closed. Blocking model or client initialization
 does not run directly on the event loop. Unavailable adapters and constructor
 failures still return HTTP 400 JSON before any streaming headers are sent.
 
@@ -114,11 +116,18 @@ downloads. Offloading uses shared worker capacity and adds no hard timeout.
 
 ## HTTP streaming teardown
 
-`/chat_stream` now owns both layers of iteration: the response closes its SSE
-generator, whose `finally` closes the adapter iterator when it supports `close()`.
-This runs after completion, iteration failure, send failure, or framework
-disconnect/cancellation teardown. Successful responses retain the SSE `start`,
-`chunk`, and `done` events. Failed or interrupted streams do not manufacture a
+`/chat_stream` owns its response iterator and request adapter. Setup retains
+ownership until the response is constructed successfully; retrieval or response
+construction failures release the client in a worker before propagating the
+original failure. Response teardown closes its SSE generator, whose `finally`
+closes the adapter iterator when it supports `close()`, then attempts client
+closure. Client cleanup is attached to the response itself, so it also runs if
+the SSE generator never starts, such as a send failure on the response headers.
+
+This ordering applies after completion, iteration failure, send failure, or
+framework disconnect/cancellation teardown. Each owner attempts cleanup once;
+client cleanup still runs when stream closure fails. Successful responses retain
+the SSE `start`, `chunk`, and `done` events. Failed or interrupted streams do not manufacture a
 `done` event. Cleanup failures are logged without replacing the original result.
 
 The response serializes synchronous reads and closure with a lock. Both run in
@@ -127,8 +136,8 @@ the event loop or closing a generator while it is executing. An AnyIO cancellati
 shield lets finalization run even inside a cancelled scope. AnyIO is an explicit
 core dependency because this finalization uses its public cancellation API.
 
-Cancellation does not kill a worker thread. A blocked provider read must return
-before closure can proceed, and a slow `close()` can also delay teardown. There
+Cancellation does not kill a worker thread. A blocked constructor or provider
+read must return before closure can proceed, and a slow `close()` can also delay teardown. There
 is no hard shutdown deadline, thread affinity, or guarantee after process
 termination or repeated direct task cancellation. Worker capacity remains shared
 and finite. Retrieval still executes synchronously in the endpoint; the response
@@ -140,7 +149,10 @@ with its request middleware. Retained iterators expose missing cleanup without
 relying on garbage collection. Event-gated reads check AnyIO scope cancellation,
 asyncio task cancellation, and a concurrent `/health` request before releasing the
 worker. Echo fallback and iterators without `close` remain covered. These tests
-use fake adapters and require no provider credentials or network access.
+also check cancellation during construction, setup failures, unstarted streams,
+and ordered client cleanup. `tests/test_openai_client_cleanup.py` checks both SDK
+shapes through the API, including legacy module and shared echo ownership.
+These tests use fake SDKs/adapters and require no credentials or network access.
 
 Configuration
 
