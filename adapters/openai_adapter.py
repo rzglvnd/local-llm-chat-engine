@@ -2,6 +2,8 @@
 import logging
 import os
 
+from settings import DEFAULT_OPENAI_TIMEOUT_SECONDS, validate_openai_timeout_seconds
+
 try:
     import openai
     OPENAI_AVAILABLE = True
@@ -24,7 +26,11 @@ def _close_stream(stream) -> None:
 
 
 class OpenAIAdapter:
-    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini"):
+    def __init__(
+        self, api_key: str = None, model: str = "gpt-4o-mini",
+        timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
+    ):
+        self._timeout_seconds = validate_openai_timeout_seconds(timeout_seconds)
         if not OPENAI_AVAILABLE:
             raise ImportError("openai package is not installed")
 
@@ -34,7 +40,9 @@ class OpenAIAdapter:
         self._closed = False
 
         if hasattr(openai, "OpenAI"):
-            self._v1_client = openai.OpenAI(api_key=self._api_key)
+            self._v1_client = openai.OpenAI(
+                api_key=self._api_key, timeout=self._timeout_seconds
+            )
         else:
             if self._api_key:
                 openai.api_key = self._api_key
@@ -74,6 +82,7 @@ class OpenAIAdapter:
             text = resp.choices[0].message.content
             return text or ""
 
+        kwargs.setdefault("request_timeout", self._timeout_seconds)
         resp = self._legacy_client.ChatCompletion.create(
             model=self.model,
             messages=messages,
@@ -111,6 +120,7 @@ class OpenAIAdapter:
                 _close_stream(stream)
             return
 
+        kwargs.setdefault("request_timeout", self._timeout_seconds)
         stream = self._legacy_client.ChatCompletion.create(
             model=self.model,
             messages=messages,

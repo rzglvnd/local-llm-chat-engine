@@ -75,6 +75,7 @@ You can start from `.env.example` and set required values.
 - `LOCAL_LLM_PORT` (default: `8001`)
 - `LOCAL_LLM_LOG_LEVEL` (default: `INFO`)
 - `LOCAL_LLM_DEFAULT_K` (default: `3`)
+- `LOCAL_LLM_OPENAI_TIMEOUT_SECONDS` (default: `60`; positive finite provider I/O timeout)
 - `LOCAL_LLM_MAX_K` (default: `20`)
 - `LOCAL_LLM_API_KEY` (optional; if set, required via `X-API-Key` on write endpoints)
 - `LOCAL_LLM_CORS_ORIGINS` (optional comma-separated list)

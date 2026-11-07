@@ -181,7 +181,10 @@ def _resolve_adapter(model_name: str):
         if not openai_adapter_available:
             raise HTTPException(status_code=400, detail="OpenAI adapter not available")
         try:
-            return OpenAIAdapter(api_key=os.environ.get("OPENAI_API_KEY"))
+            return OpenAIAdapter(
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                timeout_seconds=settings.openai_timeout_seconds,
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=400,

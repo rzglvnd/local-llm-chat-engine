@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 from types import SimpleNamespace
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -12,12 +13,16 @@ from adapters import openai_adapter
 
 @pytest.fixture(params=["modern", "legacy"])
 def provider(request, monkeypatch):
-    state = SimpleNamespace(kind=request.param, calls=[], generation_error=None, close_error=None)
+    state = SimpleNamespace(
+        kind=request.param, calls=[], generation_error=None, close_error=None,
+        requests=[], client_timeout=None, stream_error=None,
+    )
 
     def record(event):
         state.calls.append((event, threading.get_ident()))
 
     def create(**kwargs):
+        state.requests.append(kwargs)
         record("stream" if kwargs.get("stream") else "generate")
         if state.generation_error:
             raise state.generation_error
@@ -30,6 +35,8 @@ def provider(request, monkeypatch):
                         )])
                     else:
                         yield {"choices": [{"delta": {"content": "fake answer"}}]}
+                    if state.stream_error:
+                        raise state.stream_error
                 finally:
                     record("close_stream")
 
@@ -46,7 +53,8 @@ def provider(request, monkeypatch):
         if state.close_error:
             raise state.close_error
 
-    def new_client(api_key=None):
+    def new_client(api_key=None, timeout=None):
+        state.client_timeout = timeout
         return SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=close
         )
@@ -58,7 +66,8 @@ def provider(request, monkeypatch):
 
     def make_adapter(**kwargs):
         record("initialize")
-        return openai_adapter.OpenAIAdapter(api_key="fake-key")
+        kwargs["api_key"] = "fake-key"
+        return openai_adapter.OpenAIAdapter(**kwargs)
 
     state.make_adapter = make_adapter
     monkeypatch.setattr(api, "openai_adapter_available", True)
@@ -187,3 +196,72 @@ def test_streaming_request_closes_response_before_owned_sdk_client(provider):
         assert provider.response is not None
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
+def test_configured_timeout_reaches_provider_from_api(provider, monkeypatch, path):
+    monkeypatch.setattr(api, "settings", replace(api.settings, openai_timeout_seconds=12.5))
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(path, json={"message": "question", "model": "openai"})
+        assert response.status_code == 200
+        assert len(provider.requests) == 1
+        if provider.kind == "modern":
+            assert provider.client_timeout == 12.5
+            assert "request_timeout" not in provider.requests[0]
+        else:
+            assert provider.requests[0]["request_timeout"] == 12.5
+            assert "timeout" not in provider.requests[0]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
+def test_simulated_provider_timeout_releases_resources(provider, path):
+    failure = TimeoutError("simulated provider I/O timeout")
+    if path == "/chat":
+        provider.generation_error = failure
+    else:
+        provider.stream_error = failure
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=api.app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(path, json={"message": "question", "model": "openai"})
+        expected = ["initialize"]
+        if path == "/chat":
+            assert response.status_code == 500
+            expected.append("generate")
+        else:
+            # Headers and a token were sent before the simulated read timeout.
+            assert response.status_code == 200
+            events = [json.loads(line[6:]) for line in response.text.splitlines()
+                      if line.startswith("data: ")]
+            assert events == [
+                {"event": "start", "model": "openai"},
+                {"event": "chunk", "text": "fake answer"},
+            ]
+            expected += ["stream", "close_stream"]
+        if provider.kind == "modern":
+            expected.append("close")
+        assert [event for event, _ in provider.calls] == expected
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["generate", "stream"])
+def test_native_request_timeout_override_is_preserved(provider, operation):
+    adapter = provider.make_adapter(timeout_seconds=12.5)
+    key = "timeout" if provider.kind == "modern" else "request_timeout"
+    try:
+        if operation == "generate":
+            assert adapter.generate("question", **{key: 0.75}) == "fake answer"
+        else:
+            assert list(adapter.stream("question", **{key: 0.75})) == ["fake answer"]
+        assert provider.requests[0][key] == 0.75
+        if provider.kind == "modern":
+            assert provider.client_timeout == 12.5
+    finally:
+        adapter.close()

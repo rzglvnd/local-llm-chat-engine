@@ -49,7 +49,7 @@ def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked
             def stream(self, prompt, context=None):
                 yield self.generate(prompt, context=context)
 
-        def create_adapter(api_key=None):
+        def create_adapter(api_key=None, timeout_seconds=None):
             execution_threads["initialization"] = threading.get_ident()
             if blocked_phase == "initialization":
                 block_adapter()
@@ -159,7 +159,7 @@ def test_chat_preserves_adapter_error_responses(monkeypatch, failure):
         def generate(self, prompt, context=None):
             raise RuntimeError("generation failed")
 
-    def create_adapter(api_key=None):
+    def create_adapter(api_key=None, timeout_seconds=None):
         if failure == "initialization":
             raise ValueError("initialization failed")
         return FailingAdapter()

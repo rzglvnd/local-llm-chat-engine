@@ -1,6 +1,23 @@
 from dataclasses import dataclass
+import math
 import os
-from typing import List
+from typing import List, Union
+
+
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
+
+
+def validate_openai_timeout_seconds(
+    value: Union[str, float], *, name: str = "timeout_seconds"
+) -> float:
+    message = f"{name} must be a positive finite number of seconds"
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(message) from None
+    if isinstance(value, bool) or not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(message)
+    return seconds
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -42,6 +59,7 @@ class Settings:
     rate_limit_requests_per_minute: int
     rate_limit_window_seconds: int
     rate_limit_exempt_paths: List[str]
+    openai_timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS
 
 
 def load_settings() -> Settings:
@@ -72,5 +90,9 @@ def load_settings() -> Settings:
         ),
         rate_limit_exempt_paths=_as_list(
             os.environ.get("LOCAL_LLM_RATE_LIMIT_EXEMPT_PATHS", "/health,/ready"),
+        ),
+        openai_timeout_seconds=validate_openai_timeout_seconds(
+            os.environ.get("LOCAL_LLM_OPENAI_TIMEOUT_SECONDS", DEFAULT_OPENAI_TIMEOUT_SECONDS),
+            name="LOCAL_LLM_OPENAI_TIMEOUT_SECONDS",
         ),
     )

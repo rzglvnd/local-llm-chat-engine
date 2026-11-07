@@ -39,7 +39,52 @@ The framework's shared worker capacity is finite, so calls can queue under load.
 Offloading does not impose a provider timeout or forcibly stop a running thread
 on cancellation. Retrieval remains synchronous on the event loop; this test does
 not establish responsiveness during slow retrieval or CPU-heavy inference.
-Provider timeouts remain separate work.
+Provider I/O timeout configuration is described below.
+
+## Provider I/O timeout
+
+`LOCAL_LLM_OPENAI_TIMEOUT_SECONDS` sets the OpenAI transport timeout default for
+both `/chat` and `/chat_stream`. Its default is **60 seconds**; positive finite
+fractional values are accepted. Empty, malformed, zero, negative, NaN, and
+infinite values raise a configuration error when settings load, before the API
+starts. Set the environment variable before starting the process; `.env.example`
+is a configuration template, not an automatically loaded file.
+
+The API passes this value to `OpenAIAdapter(timeout_seconds=...)`. Direct adapter
+construction defaults to the same 60 seconds and validates the constructor value
+before creating a client. The SDK branches use different transport arguments:
+
+| SDK shape | Default forwarding |
+| --- | --- |
+| Modern `OpenAI` client | Constructor `timeout=<seconds>` |
+| Legacy `ChatCompletion` module | Per-call `request_timeout=<seconds>` for generation and streaming |
+
+The legacy mapping was checked against the published `openai==0.27.0` source,
+the minimum supported optional dependency. It does not mutate a shared module
+timeout. Existing SDK-specific request kwargs remain forwarded: direct callers
+can override these defaults with modern `timeout` or legacy `request_timeout`.
+Those overrides retain SDK semantics and are outside this setting's validation.
+The HTTP chat request schema does not expose these overrides.
+
+This is an SDK I/O timeout default, not a deadline for the entire request. For
+the synchronous transports, read timeouts concern waiting for data; continuing
+stream activity can extend total duration. The current modern SDK retries timed
+out requests by default, while legacy retry details depend on the installed
+version. This change leaves SDK retry behavior unchanged. See the
+[official SDK timeout and retry guidance](https://developers.openai.com/api/reference/python#timeouts).
+Retrieval, worker queueing, local Hugging Face inference, and cleanup are not
+bounded by this setting. A timeout does not forcibly terminate a worker thread.
+
+Timeout errors retain the existing API behavior: unhandled generation errors
+produce HTTP 500. Once SSE headers have been sent, a stream error cannot replace
+the status; the stream can end with partial output and no `done` event. The
+existing ownership cleanup still attempts stream and client closure.
+
+`tests/test_openai_timeouts.py` checks configuration and constructor validation.
+`tests/test_openai_client_cleanup.py` checks both SDK mappings through the API,
+native request overrides, and cleanup after simulated request/read timeouts.
+These are fake SDK tests, not measurements of real network timeout enforcement;
+they require no provider credentials or live requests.
 
 ## SDK client ownership
 
@@ -112,7 +157,7 @@ failures still return HTTP 400 JSON before any streaming headers are sent.
 initialization is gated by an event, before the fake constructor is released.
 It also checks SSE output and context forwarding; initialization error cases
 cover both adapter backends. The tests require no provider credentials or model
-downloads. Offloading uses shared worker capacity and adds no hard timeout.
+downloads. Offloading uses shared worker capacity and adds no hard deadline.
 
 ## HTTP streaming teardown
 
@@ -141,7 +186,7 @@ read must return before closure can proceed, and a slow `close()` can also delay
 is no hard shutdown deadline, thread affinity, or guarantee after process
 termination or repeated direct task cancellation. Worker capacity remains shared
 and finite. Retrieval still executes synchronously in the endpoint; the response
-ownership mechanism does not offload retrieval or impose provider timeouts.
+ownership mechanism does not offload retrieval or bound cleanup duration.
 
 `tests/test_chat_stream_cleanup.py` drives ASGI receive/send directly for both
 receive-disconnect and send-error paths, and also checks the full application

@@ -51,7 +51,8 @@ def provider(request, monkeypatch):
     monkeypatch.setattr(openai_adapter, "OPENAI_AVAILABLE", True)
     adapter = openai_adapter.OpenAIAdapter(api_key="fake-key", model="fake-model")
     return SimpleNamespace(
-        adapter=adapter, stream=stream, create=create, client_close=client_close, chunk=chunk
+        adapter=adapter, stream=stream, create=create, client_close=client_close, chunk=chunk,
+        kind=request.param,
     )
 
 
@@ -85,6 +86,7 @@ def test_stream_closes_owned_response(provider, ending):
         ],
         stream=True,
         temperature=0,
+        **({"request_timeout": 60.0} if provider.kind == "legacy" else {}),
     )
 
 
