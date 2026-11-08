@@ -15,7 +15,7 @@ from adapters import openai_adapter
 def provider(request, monkeypatch):
     state = SimpleNamespace(
         kind=request.param, calls=[], generation_error=None, close_error=None,
-        requests=[], client_timeout=None, stream_error=None,
+        requests=[], client_timeout=None, client_retries=None, stream_error=None,
     )
 
     def record(event):
@@ -53,14 +53,17 @@ def provider(request, monkeypatch):
         if state.close_error:
             raise state.close_error
 
-    def new_client(api_key=None, timeout=None):
+    def new_client(api_key=None, timeout=None, max_retries=None):
         state.client_timeout = timeout
+        state.client_retries = max_retries
         return SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=close
         )
 
     sdk = (SimpleNamespace(OpenAI=new_client) if state.kind == "modern" else
            SimpleNamespace(ChatCompletion=SimpleNamespace(create=create), close=close))
+    sdk.api_key = "borrowed-key-sentinel"
+    state.sdk = sdk
     monkeypatch.setattr(openai_adapter, "OPENAI_AVAILABLE", True)
     monkeypatch.setattr(openai_adapter, "openai", sdk)
 
@@ -219,7 +222,9 @@ def test_configured_timeout_reaches_provider_from_api(provider, monkeypatch, pat
 
 
 @pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
-def test_simulated_provider_timeout_releases_resources(provider, path):
+def test_simulated_provider_timeout_releases_resources(provider, monkeypatch, path):
+    retry_limit = 3 if provider.kind == "modern" else None
+    monkeypatch.setattr(api, "settings", replace(api.settings, openai_max_retries=retry_limit))
     failure = TimeoutError("simulated provider I/O timeout")
     if path == "/chat":
         provider.generation_error = failure
@@ -247,6 +252,11 @@ def test_simulated_provider_timeout_releases_resources(provider, path):
         if provider.kind == "modern":
             expected.append("close")
         assert [event for event, _ in provider.calls] == expected
+        # The application invokes the SDK once even after partial stream output.
+        # Internal HTTP retry attempts belong to the SDK and are not simulated.
+        assert len(provider.requests) == 1
+        assert "max_retries" not in provider.requests[0]
+        assert provider.client_retries == retry_limit
 
     asyncio.run(scenario())
 
@@ -265,3 +275,42 @@ def test_native_request_timeout_override_is_preserved(provider, operation):
             assert provider.client_timeout == 12.5
     finally:
         adapter.close()
+
+
+@pytest.mark.parametrize("provider", ["modern"], indirect=True)
+@pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
+@pytest.mark.parametrize("limit", [0, 3])
+def test_configured_retry_limit_reaches_modern_sdk(provider, monkeypatch, path, limit):
+    monkeypatch.setattr(api, "settings", replace(api.settings, openai_max_retries=limit))
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(path, json={"message": "question", "model": "openai"})
+        assert response.status_code == 200
+        assert provider.client_retries == limit
+        assert len(provider.requests) == 1
+        assert "max_retries" not in provider.requests[0]
+        assert provider.calls[-1][0] == "close"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["legacy"], indirect=True)
+@pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
+@pytest.mark.parametrize("limit", [0, 2])
+def test_legacy_rejects_explicit_retry_setting_before_requests(provider, monkeypatch, path, limit):
+    monkeypatch.setattr(api, "settings", replace(api.settings, openai_max_retries=limit))
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(path, json={"message": "question", "model": "openai"})
+        assert response.status_code == 400
+        assert response.headers["content-type"] == "application/json"
+        assert "max_retries requires the modern OpenAI SDK" in response.json()["detail"]
+        assert [event for event, _ in provider.calls] == ["initialize"]
+        assert provider.requests == []
+        assert provider.sdk.api_key == "borrowed-key-sentinel"
+
+    asyncio.run(scenario())

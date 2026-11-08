@@ -1,8 +1,14 @@
 """OpenAI adapter with optional streaming support."""
 import logging
 import os
+from typing import Optional
 
-from settings import DEFAULT_OPENAI_TIMEOUT_SECONDS, validate_openai_timeout_seconds
+from settings import (
+    DEFAULT_OPENAI_MAX_RETRIES,
+    DEFAULT_OPENAI_TIMEOUT_SECONDS,
+    validate_openai_max_retries,
+    validate_openai_timeout_seconds,
+)
 
 try:
     import openai
@@ -29,8 +35,10 @@ class OpenAIAdapter:
     def __init__(
         self, api_key: str = None, model: str = "gpt-4o-mini",
         timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
+        max_retries: Optional[int] = None,
     ):
         self._timeout_seconds = validate_openai_timeout_seconds(timeout_seconds)
+        requested_retries = validate_openai_max_retries(max_retries)
         if not OPENAI_AVAILABLE:
             raise ImportError("openai package is not installed")
 
@@ -41,9 +49,17 @@ class OpenAIAdapter:
 
         if hasattr(openai, "OpenAI"):
             self._v1_client = openai.OpenAI(
-                api_key=self._api_key, timeout=self._timeout_seconds
+                api_key=self._api_key, timeout=self._timeout_seconds,
+                max_retries=(
+                    DEFAULT_OPENAI_MAX_RETRIES if requested_retries is None else requested_retries
+                ),
             )
         else:
+            if requested_retries is not None:
+                raise ValueError(
+                    "max_retries requires the modern OpenAI SDK; "
+                    "leave LOCAL_LLM_OPENAI_MAX_RETRIES unset for the legacy SDK"
+                )
             if self._api_key:
                 openai.api_key = self._api_key
             self._legacy_client = openai

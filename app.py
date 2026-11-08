@@ -184,6 +184,7 @@ def _resolve_adapter(model_name: str):
             return OpenAIAdapter(
                 api_key=os.environ.get("OPENAI_API_KEY"),
                 timeout_seconds=settings.openai_timeout_seconds,
+                max_retries=settings.openai_max_retries,
             )
         except Exception as exc:
             raise HTTPException(

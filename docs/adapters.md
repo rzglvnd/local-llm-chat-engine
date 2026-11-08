@@ -68,9 +68,9 @@ The HTTP chat request schema does not expose these overrides.
 
 This is an SDK I/O timeout default, not a deadline for the entire request. For
 the synchronous transports, read timeouts concern waiting for data; continuing
-stream activity can extend total duration. The current modern SDK retries timed
-out requests by default, while legacy retry details depend on the installed
-version. This change leaves SDK retry behavior unchanged. See the
+stream activity can extend total duration. The modern adapter defaults to two
+SDK retries, configurable as described below; legacy retry details depend on the
+installed version. See the
 [official SDK timeout and retry guidance](https://developers.openai.com/api/reference/python#timeouts).
 Retrieval, worker queueing, local Hugging Face inference, and cleanup are not
 bounded by this setting. A timeout does not forcibly terminate a worker thread.
@@ -85,6 +85,50 @@ existing ownership cleanup still attempts stream and client closure.
 native request overrides, and cleanup after simulated request/read timeouts.
 These are fake SDK tests, not measurements of real network timeout enforcement;
 they require no provider credentials or live requests.
+
+## Provider retry policy
+
+`LOCAL_LLM_OPENAI_MAX_RETRIES` controls retries in the modern SDK client for both
+chat endpoints. Set it before process startup to a non-negative integer. `0`
+disables SDK retries; `N` permits up to `N` additional attempts for SDK-eligible
+failures. Two retries therefore permit up to three attempts. Empty, negative,
+fractional, and malformed settings fail configuration loading. Direct constructor
+validation also rejects booleans and floats, including integral floats.
+
+| Configuration | Modern `OpenAI` client | Legacy `ChatCompletion` module |
+| --- | --- | --- |
+| Unset / constructor `max_retries=None` | Explicitly passes `max_retries=2`, preserving the current SDK default | Keeps native SDK retry behavior |
+| Explicit `0` | Disables retries | Rejects initialization |
+| Explicit positive integer | Passes that retry limit | Rejects initialization |
+
+The unset value is retained as `None` in settings so it remains distinct from an
+explicit zero. Legacy SDKs do not expose the same per-client control. Explicit
+retry configuration on a legacy adapter raises a clear error before requests or
+shared-module mutation; the API returns HTTP 400 JSON before starting SSE.
+Leave the variable unset when using a legacy SDK. The example environment file
+keeps it commented out so copying that template preserves legacy compatibility.
+
+Direct callers can construct `OpenAIAdapter(max_retries=0)` or another supported
+integer. The setting is passed to the modern client constructor, not to model
+request bodies or shared legacy retry globals. The HTTP request schema does not
+expose a per-request retry override.
+
+The SDK retains responsibility for eligible errors, backoff, and server retry
+hints. The application adds no retry loop. According to the
+[official SDK guidance](https://developers.openai.com/api/reference/python#retries),
+stream consumption is not automatically retried. An error after partial output
+therefore follows the existing cleanup path without application-level replay or
+a fabricated `done` event. This avoids duplicating already delivered output.
+
+A retry count does not establish a total time budget: I/O phases, retry delays,
+stream activity, and worker queueing can extend elapsed time. In particular,
+`timeout=60` and `max_retries=2` are not a 180-second request deadline.
+
+`tests/test_openai_retries.py` checks settings and constructor validation plus the
+explicit modern default. API tests in `tests/test_openai_client_cleanup.py` check
+zero/positive forwarding, legacy rejection, cleanup, and a single application SDK
+invocation after simulated failure. These fake SDK tests do not measure or
+simulate internal HTTP attempt counts or backoff timing and need no credentials.
 
 ## SDK client ownership
 

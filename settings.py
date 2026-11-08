@@ -1,10 +1,28 @@
 from dataclasses import dataclass
 import math
 import os
-from typing import List, Union
+from typing import List, Optional, Union
 
 
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
+DEFAULT_OPENAI_MAX_RETRIES = 2
+
+
+def validate_openai_max_retries(
+    value: Optional[Union[str, int]], *, name: str = "max_retries"
+) -> Optional[int]:
+    if value is None:
+        return None
+    message = f"{name} must be a non-negative integer"
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(message)
+    try:
+        retries = int(value)
+    except ValueError:
+        raise ValueError(message) from None
+    if retries < 0:
+        raise ValueError(message)
+    return retries
 
 
 def validate_openai_timeout_seconds(
@@ -60,6 +78,7 @@ class Settings:
     rate_limit_window_seconds: int
     rate_limit_exempt_paths: List[str]
     openai_timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS
+    openai_max_retries: Optional[int] = None
 
 
 def load_settings() -> Settings:
@@ -94,5 +113,9 @@ def load_settings() -> Settings:
         openai_timeout_seconds=validate_openai_timeout_seconds(
             os.environ.get("LOCAL_LLM_OPENAI_TIMEOUT_SECONDS", DEFAULT_OPENAI_TIMEOUT_SECONDS),
             name="LOCAL_LLM_OPENAI_TIMEOUT_SECONDS",
+        ),
+        openai_max_retries=validate_openai_max_retries(
+            os.environ.get("LOCAL_LLM_OPENAI_MAX_RETRIES"),
+            name="LOCAL_LLM_OPENAI_MAX_RETRIES",
         ),
     )
