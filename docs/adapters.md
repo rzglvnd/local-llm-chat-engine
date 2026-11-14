@@ -130,6 +130,49 @@ zero/positive forwarding, legacy rejection, cleanup, and a single application SD
 invocation after simulated failure. These fake SDK tests do not measure or
 simulate internal HTTP attempt counts or backoff timing and need no credentials.
 
+## Offline SDK retry contracts
+
+`tests/sdk_contract/test_retry_transport.py` complements those fake SDK tests by
+running the real **OpenAI SDK 3.51.0** with **HTTPX2 2.16.0**. The pair is pinned
+in `requirements-sdk-contract.txt`; this environment requires Python 3.11+.
+The dedicated CI job runs on Python 3.11. Local validation also ran on 3.12.
+
+Only the client factory is wrapped to inject an HTTPX2 mock transport and an
+`.invalid` base URL. SDK requests, retry decisions, response parsing, error
+translation, and streaming code execute normally. Requests use a dummy key;
+socket connection and DNS entry points are blocked during each test. Observed
+transport requests establish the following contracts for the pinned pair:
+
+| Scenario | Expected transport attempts / result |
+| --- | --- |
+| Persistent 503, `max_retries=0` | One attempt, then SDK server error |
+| Persistent 503, `max_retries=2` | Three attempts, then SDK server error |
+| 503 followed by 200 | Two attempts, then generated text |
+| Ordinary 400, `max_retries=2` | One attempt, then SDK bad-request error |
+| Read failure after one streamed token | One attempt, no replay; response, client, and transport close |
+
+Synthetic error responses include `retry-after-ms: 1`, a public server retry
+hint, to keep the real SDK waits short. Tests count requests and assert cleanup;
+they neither replace SDK sleep/retry internals nor assert elapsed time. Version
+assertions make a changed SDK/transport pair require deliberate revalidation.
+
+In a dedicated Python 3.11+ environment, from the repository root:
+
+```bash
+python -m pip install -r requirements-sdk-contract.txt
+python -m pytest -q tests/sdk_contract
+```
+
+The ordinary suite skips this module when its optional SDK/transport dependencies
+are absent. The dedicated CI job installs the pinned pair, reports their versions
+with real imports, and runs the contract module explicitly. No model downloads,
+provider credentials, or live API requests are needed. Supporting dependencies
+are resolved by pip; the SDK and HTTP transport are the explicit version pins.
+
+These checks validate SDK behavior with synthetic HTTP responses, not service
+latency, real network timeout enforcement, legacy SDK retries, or every supported
+SDK release. They supplement the API wiring and lifecycle tests above.
+
 ## SDK client ownership
 
 The modern `OpenAIAdapter` constructs and owns its SDK client. Its `close()`
