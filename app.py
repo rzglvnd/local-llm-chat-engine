@@ -408,7 +408,8 @@ async def search_auto(payload: SearchRequest):
 async def chat(req: ChatRequest):
     query = req.message
     k = _sanitize_k(req.k)
-    contexts = [r["text"] for r in store.search(query, k=k)]
+    results = await run_in_threadpool(store.search, query, k=k)
+    contexts = [r["text"] for r in results]
     resp = await run_in_threadpool(_generate_chat_response, req.model, query, contexts)
     return {"model": req.model, "response": resp, "context_count": len(contexts)}
 
@@ -479,8 +480,8 @@ async def chat_stream(payload: ChatRequest):
     try:
         adapter = await run_in_threadpool(owner.initialize)
 
-        # get context from store
-        contexts = [r["text"] for r in store.search(message, k=k)]
+        results = await run_in_threadpool(store.search, message, k=k)
+        contexts = [r["text"] for r in results]
 
         def event_stream():
             yield _sse_encode({"event": "start", "model": model_name})

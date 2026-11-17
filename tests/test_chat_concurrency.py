@@ -8,9 +8,9 @@ import pytest
 import app as api
 
 
-@pytest.mark.parametrize("blocked_phase", ["initialization", "generation"])
+@pytest.mark.parametrize("blocked_phase", ["retrieval", "initialization", "generation"])
 @pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
-def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked_phase, path):
+def test_health_responds_while_chat_work_is_blocked(monkeypatch, blocked_phase, path):
     async def scenario():
         loop = asyncio.get_running_loop()
         loop_thread = threading.get_ident()
@@ -23,7 +23,7 @@ def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked
         generations = []
         response_starts = []
 
-        def block_adapter():
+        def block_work():
             loop.call_soon_threadsafe(entered.set)
             try:
                 # This watchdog also frees a broken implementation that blocks
@@ -36,6 +36,8 @@ def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked
         def search(query, k):
             execution_threads["retrieval"] = threading.get_ident()
             searches.append((query, k))
+            if blocked_phase == "retrieval":
+                block_work()
             return [{"text": "first context"}, {"text": "second context"}]
 
         class FakeAdapter:
@@ -43,7 +45,7 @@ def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked
                 execution_threads["generation"] = threading.get_ident()
                 generations.append((prompt, context))
                 if blocked_phase == "generation":
-                    block_adapter()
+                    block_work()
                 return "fake response"
 
             def stream(self, prompt, context=None):
@@ -52,7 +54,7 @@ def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked
         def create_adapter(api_key=None, timeout_seconds=None, max_retries=None):
             execution_threads["initialization"] = threading.get_ident()
             if blocked_phase == "initialization":
-                block_adapter()
+                block_work()
             return FakeAdapter()
 
         monkeypatch.setattr(api.store, "search", search)
@@ -76,12 +78,12 @@ def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked
                 await asyncio.wait_for(entered.wait(), timeout=5)
                 assert not watchdog_expired.is_set(), "chat blocked the event loop"
                 assert not chat.done()
-                if blocked_phase == "initialization":
+                if blocked_phase in {"retrieval", "initialization"}:
                     assert response_starts == []
                 health = await asyncio.wait_for(client.get("/health"), timeout=5)
                 assert health.status_code == 200
                 assert health.json() == {"status": "ok"}
-                # The response must arrive before allowing the adapter to return.
+                # The response must arrive before allowing blocked work to return.
                 assert not release.is_set()
                 assert not returned.is_set()
                 assert not chat.done()
@@ -106,11 +108,54 @@ def test_health_responds_while_chat_adapter_work_is_blocked(monkeypatch, blocked
                 ]
         assert searches == [("explain", 2)]
         assert generations == [("explain", ["first context", "second context"])]
-        assert execution_threads["retrieval"] == loop_thread
+        assert execution_threads["retrieval"] != loop_thread
         assert execution_threads["initialization"] != loop_thread
         assert execution_threads["generation"] != loop_thread
         if path == "/chat":
             assert execution_threads["generation"] == execution_threads["initialization"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path", ["/chat", "/chat_stream"])
+def test_retrieval_failure_precedes_generation_and_sse_headers(monkeypatch, path):
+    initializations = []
+    closures = []
+
+    class FakeAdapter:
+        def generate(self, *args, **kwargs):
+            pytest.fail("generation must not run after retrieval fails")
+
+        def stream(self, *args, **kwargs):
+            pytest.fail("streaming must not run after retrieval fails")
+
+        def close(self):
+            closures.append(threading.get_ident())
+
+    def create_adapter(**kwargs):
+        initializations.append(threading.get_ident())
+        return FakeAdapter()
+
+    def fail_search(query, k):
+        raise RuntimeError("retrieval failed")
+
+    monkeypatch.setattr(api.store, "search", fail_search)
+    monkeypatch.setattr(api, "openai_adapter_available", True)
+    monkeypatch.setattr(api, "OpenAIAdapter", create_adapter)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=api.app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(path, json={"message": "explain", "model": "openai"})
+        assert response.status_code == 500
+        assert response.headers["content-type"].startswith("text/plain")
+        assert response.text == "Internal Server Error"
+        if path == "/chat":
+            assert initializations == closures == []
+        else:
+            assert len(initializations) == len(closures) == 1
+            assert initializations[0] != threading.get_ident()
+            assert closures[0] != threading.get_ident()
 
     asyncio.run(scenario())
 

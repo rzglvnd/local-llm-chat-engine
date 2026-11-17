@@ -21,15 +21,15 @@ curl -N -X POST http://127.0.0.1:8001/chat_stream -H "Content-Type: application/
 
 ## Non-streaming execution
 
-`/chat` retrieves contexts in the request's existing event-loop context, then
-awaits one framework thread-pool call that initializes the adapter and generates
-the response. Both adapter steps run in the same worker thread, so blocking
+`/chat` awaits context retrieval in the framework thread pool, then awaits a
+separate worker call that initializes the adapter and generates the response.
+Both adapter steps run in the same worker thread, so blocking
 provider I/O or model initialization does not execute directly on the event loop.
 The response still contains `model`, `response`, and `context_count`. Unavailable
 adapters and initialization failures still return HTTP 400; unhandled generation
 failures return HTTP 500.
 
-`tests/test_chat_concurrency.py` gates fake initialization and generation with
+`tests/test_chat_concurrency.py` gates fake retrieval, initialization, and generation with
 events. In each case, `/health` must respond before the fake work is released.
 It also checks execution threads, context forwarding, and error responses.
 Run it with `python -m pytest -q tests/test_chat_concurrency.py`; no provider
@@ -37,8 +37,8 @@ credentials, network calls, or model downloads are needed.
 
 The framework's shared worker capacity is finite, so calls can queue under load.
 Offloading does not impose a provider timeout or forcibly stop a running thread
-on cancellation. Retrieval remains synchronous on the event loop; this test does
-not establish responsiveness during slow retrieval or CPU-heavy inference.
+on cancellation. These tests establish ordering with blocked fake operations;
+they do not measure throughput or responsiveness under CPU-heavy inference.
 Provider I/O timeout configuration is described below.
 
 ## Provider I/O timeout
@@ -230,6 +230,34 @@ its active streams have finished or been closed.
 check cleanup, unchanged chunks and request arguments, error propagation, and
 client ownership. It needs no credentials, SDK installation, or network access.
 
+## Chat retrieval
+
+Both `/chat` and `/chat_stream` await TF-IDF search in the framework thread pool.
+Context extraction and forwarding retain the retrieved order and sanitized `k`.
+The store's existing reentrant lock protects search and mutation; this change
+does not introduce concurrent index mutation or remove lock contention.
+
+`/chat` retrieves before constructing its adapter. `/chat_stream` constructs its
+adapter first, then retrieves before returning a response. A retrieval failure
+therefore remains an HTTP 500 before SSE headers; streaming setup releases its
+acquired SDK client before propagating the error. No provider generation starts
+after a retrieval failure.
+
+`tests/test_chat_concurrency.py` gates retrieval, initialization, and generation
+separately and checks that `/health` responds before each gate is released. It
+also checks context forwarding, response shape, and retrieval failure behavior.
+`tests/test_chat_stream_cleanup.py` checks cancellation during retrieval: an
+AnyIO cancellation scope waits for the worker, while direct task cancellation
+can stop awaiting it. The latter can close the unused adapter client while the
+retrieval worker continues; no provider stream has started. Tests release the
+gated work and await its completion, verifying client cleanup without emitting SSE.
+
+Offloading keeps these chat operations off the event loop; it does not establish
+CPU parallelism, higher throughput, or an end-to-end deadline. Worker capacity
+is shared and finite. Other endpoints still call store operations synchronously;
+those that acquire the same store lock can block the event loop while a chat
+search holds it. Their execution boundaries need a separate audit.
+
 ## Streaming initialization
 
 `/chat_stream` awaits adapter construction in the framework thread pool before
@@ -272,8 +300,8 @@ Cancellation does not kill a worker thread. A blocked constructor or provider
 read must return before closure can proceed, and a slow `close()` can also delay teardown. There
 is no hard shutdown deadline, thread affinity, or guarantee after process
 termination or repeated direct task cancellation. Worker capacity remains shared
-and finite. Retrieval still executes synchronously in the endpoint; the response
-ownership mechanism does not offload retrieval or bound cleanup duration.
+and finite. Chat retrieval is offloaded as described above; the response
+ownership mechanism does not bound retrieval or cleanup duration.
 
 `tests/test_chat_stream_cleanup.py` drives ASGI receive/send directly for both
 receive-disconnect and send-error paths, and also checks the full application
@@ -281,7 +309,7 @@ with its request middleware. Retained iterators expose missing cleanup without
 relying on garbage collection. Event-gated reads check AnyIO scope cancellation,
 asyncio task cancellation, and a concurrent `/health` request before releasing the
 worker. Echo fallback and iterators without `close` remain covered. These tests
-also check cancellation during construction, setup failures, unstarted streams,
+also check cancellation during construction and retrieval, setup failures, unstarted streams,
 and ordered client cleanup. `tests/test_openai_client_cleanup.py` checks both SDK
 shapes through the API, including legacy module and shared echo ownership.
 These tests use fake SDKs/adapters and require no credentials or network access.

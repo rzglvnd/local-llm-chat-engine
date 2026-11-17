@@ -375,31 +375,41 @@ def test_setup_failure_closes_acquired_client(monkeypatch, failure_point):
 
 
 @pytest.mark.parametrize("cancellation", ["scope", "task"])
-def test_cancelled_construction_closes_client_after_constructor_returns(monkeypatch, cancellation):
+@pytest.mark.parametrize("blocked_phase", ["construction", "retrieval"])
+def test_cancelled_setup_closes_client(monkeypatch, cancellation, blocked_phase):
     async def scenario():
         loop = asyncio.get_running_loop()
         loop_thread = threading.get_ident()
         entered = asyncio.Event()
+        finished = asyncio.Event()
         release = threading.Event()
         watchdog_expired = threading.Event()
         source = TrackedStream(["one"])
         calls = configure_stream(monkeypatch, source, source.close_client)
-        resolve = api._resolve_adapter
+        work = api._resolve_adapter if blocked_phase == "construction" else api.store.search
 
-        def blocked_resolve(name):
+        def blocked_work(*args, **kwargs):
             loop.call_soon_threadsafe(entered.set)
-            if not release.wait(timeout=5):
-                watchdog_expired.set()
-            return resolve(name)
+            try:
+                if not release.wait(timeout=5):
+                    watchdog_expired.set()
+                return work(*args, **kwargs)
+            finally:
+                loop.call_soon_threadsafe(finished.set)
 
-        monkeypatch.setattr(api, "_resolve_adapter", blocked_resolve)
+        if blocked_phase == "construction":
+            monkeypatch.setattr(api, "_resolve_adapter", blocked_work)
+        else:
+            monkeypatch.setattr(api.store, "search", blocked_work)
         cancel_scope = anyio.CancelScope()
+        messages = []
 
         async def receive():
             await anyio.sleep_forever()
 
         async def send(message):
             await anyio.lowlevel.checkpoint()
+            messages.append(message)
 
         async def invoke():
             with cancel_scope:
@@ -420,12 +430,21 @@ def test_cancelled_construction_closes_client_after_constructor_returns(monkeypa
                 health = await asyncio.wait_for(client.get("/health"), timeout=5)
             assert health.status_code == 200
             assert not watchdog_expired.is_set()
-            assert source.teardown == []
-            assert not task.done()
+            if blocked_phase == "retrieval" and cancellation == "task":
+                # Retrieval has not acquired a provider stream or used the
+                # adapter; its abandoned worker need not delay client cleanup.
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+                assert source.teardown == ["client"]
+                assert not finished.is_set()
+            else:
+                assert source.teardown == []
+                assert not task.done()
         finally:
             release.set()
             result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+            await asyncio.wait_for(finished.wait(), timeout=5)
         assert calls == []
+        assert messages == []
         assert source.teardown == ["client"]
         assert source.client_close_thread != loop_thread
         if cancellation == "task":
