@@ -351,7 +351,8 @@ async def health():
 
 @app.get("/ready")
 async def ready():
-    return {"status": "ok", **_backend_status()}
+    backend_status = await run_in_threadpool(_backend_status)
+    return {"status": "ok", **backend_status}
 
 
 @app.post("/ingest")
