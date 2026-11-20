@@ -378,7 +378,8 @@ async def ingest_embeddings(payload: IngestRequest, _: None = Depends(require_ap
 async def search(payload: SearchRequest):
     k = _sanitize_k(payload.k)
     query = payload.query
-    return {"results": store.search(query, k=k)}
+    results = await run_in_threadpool(store.search, query, k=k)
+    return {"results": results}
 
 
 @app.post("/search_embeddings")
@@ -402,7 +403,8 @@ async def search_auto(payload: SearchRequest):
         return {"backend": "faiss", "results": faiss_store.search(query, k=k)}
     if embeddings_available and embedding_store is not None:
         return {"backend": "embeddings", "results": embedding_store.search(query, k=k)}
-    return {"backend": "tfidf", "results": store.search(query, k=k)}
+    results = await run_in_threadpool(store.search, query, k=k)
+    return {"backend": "tfidf", "results": results}
 
 
 @app.post("/chat")

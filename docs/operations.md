@@ -29,6 +29,17 @@ the lock, it checks the readiness response and store statistics. A separate case
 checks status-collection failure. These controlled ordering checks do not
 measure production probe latency or establish behavior under worker exhaustion.
 
+TF-IDF search
+
+`/search` and the TF-IDF fallback in `/search_auto` run scoring and wait for the
+store lock in the shared thread pool. Search latency still depends on worker
+availability and store contention. The optional FAISS and embeddings search
+paths run synchronously on the event loop.
+
+`tests/test_search_concurrency.py` verifies that `/health` responds while either
+TF-IDF route waits for the real store lock. It then releases the lock and
+checks the ranked results, the configured `k` limit, and the fallback label.
+
 Rate limiting
 
 - Enable with `LOCAL_LLM_RATE_LIMIT_ENABLED=true`.
