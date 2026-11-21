@@ -358,8 +358,7 @@ async def ready():
 @app.post("/ingest")
 async def ingest(payload: IngestRequest, _: None = Depends(require_api_key)):
     documents = _normalize_documents(payload.documents)
-    res = store.ingest(documents)
-    return res
+    return await run_in_threadpool(store.ingest, documents)
 
 
 @app.post("/ingest_embeddings")
@@ -518,8 +517,8 @@ async def save_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    store.save(path)
-    return {"saved": path, "documents": store.stats()["documents"]}
+    documents = store.save(path)
+    return {"saved": path, "documents": documents}
 
 
 @app.post("/snapshot/load")
@@ -527,8 +526,8 @@ async def load_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_
     path = payload.path or settings.snapshot_path
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Snapshot not found at '{path}'")
-    store.load(path)
-    return {"loaded": path, "documents": store.stats()["documents"]}
+    documents = store.load(path)
+    return {"loaded": path, "documents": documents}
 
 
 @app.post("/ingest_faiss")

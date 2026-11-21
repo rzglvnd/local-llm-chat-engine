@@ -124,17 +124,19 @@ class DocumentStore:
                 )
             return results
 
-    def save(self, path: str):
+    def save(self, path: str) -> int:
         with self._lock:
+            # Ingestion can append rows or replace their fields during serialization.
             data = {
-                "ids": self.ids,
-                "docs": self.docs,
-                "metadatas": self.metadatas,
+                "ids": self.ids.copy(),
+                "docs": self.docs.copy(),
+                "metadatas": self.metadatas.copy(),
             }
         with open(path, "wb") as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return len(data["docs"])
 
-    def load(self, path: str):
+    def load(self, path: str) -> int:
         with open(path, "rb") as f:
             data = pickle.load(f)
         with self._lock:
@@ -143,3 +145,4 @@ class DocumentStore:
             self.metadatas = data.get("metadatas", [])
             self._id_to_index = {doc_id: i for i, doc_id in enumerate(self.ids)}
             self._rebuild_vectorizer()
+            return len(self.docs)

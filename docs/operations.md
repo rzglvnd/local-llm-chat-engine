@@ -40,6 +40,15 @@ paths run synchronously on the event loop.
 TF-IDF route waits for the real store lock. It then releases the lock and
 checks the ranked results, the configured `k` limit, and the fallback label.
 
+TF-IDF ingestion
+
+`/ingest` runs the document update and index rebuild in the shared thread pool.
+The store lock covers both steps, so a search that arrives mid-rebuild waits for
+the new index. `/health` can respond while the ingest and search are pending.
+`tests/test_ingest_concurrency.py` exercises that ordering and verifies that the
+waiting search returns the newly indexed document. Worker capacity and the
+shared lock still limit concurrent ingestion and search.
+
 Rate limiting
 
 - Enable with `LOCAL_LLM_RATE_LIMIT_ENABLED=true`.
@@ -75,3 +84,7 @@ Backup and restore
 - Save: `POST /snapshot/save`
 - Restore: `POST /snapshot/load`
 - Store snapshots in a durable volume when running in containers.
+- Save copies the document lists under the store lock, then serializes the
+  captured state. Ingestion can continue while that copy is being written.
+- Snapshot responses count the documents captured by save or installed by load.
+  Both snapshot routes still perform their file operations on the event loop.
