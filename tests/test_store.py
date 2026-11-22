@@ -1,6 +1,8 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
+import pytest
 from fastapi.testclient import TestClient
 
 import app as api
@@ -60,3 +62,57 @@ def test_save_captures_documents_before_concurrent_ingest(monkeypatch, tmp_path)
     assert hit["id"] == "one"
     assert hit["text"] == "original text"
     assert hit["metadata"] == {"version": 1}
+
+
+def test_save_replaces_existing_snapshot_after_serialization(monkeypatch, tmp_path):
+    store = DocumentStore()
+    snapshot = tmp_path / "store.pkl"
+    store.ingest([{"id": "one", "text": "original text"}])
+    assert store.save(snapshot) == 1
+    previous = snapshot.read_bytes()
+    store.ingest([{"id": "two", "text": "postgres replication"}])
+    dump = store_module.pickle.dump
+
+    def observe_dump(data, file, protocol):
+        dump(data, file, protocol=protocol)
+        assert snapshot.read_bytes() == previous
+
+    monkeypatch.setattr(store_module.pickle, "dump", observe_dump)
+    assert store.save(snapshot) == 2
+    assert list(tmp_path.iterdir()) == [snapshot]
+    restored = DocumentStore()
+    assert restored.load(snapshot) == 2
+    hit, = restored.search("postgres replication", k=1)
+    assert hit["id"] == "two"
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "replace"])
+def test_failed_save_preserves_previous_snapshot(monkeypatch, tmp_path, failure_stage):
+    store = DocumentStore()
+    snapshot = tmp_path / "store.pkl"
+    store.ingest([{"id": "one", "text": "original text"}])
+    store.save(snapshot)
+    previous = snapshot.read_bytes()
+    store.ingest([{"id": "two", "text": "new text"}])
+    failure = OSError(f"injected {failure_stage} failure")
+
+    def fail_write(data, file, protocol):
+        file.write(b"partial snapshot data")
+        raise failure
+
+    def fail_replace(source, destination):
+        raise failure
+
+    with monkeypatch.context() as patch:
+        if failure_stage == "write":
+            patch.setattr(store_module.pickle, "dump", fail_write)
+        else:
+            patch.setattr(os, "replace", fail_replace)
+        with pytest.raises(OSError) as raised:
+            store.save(snapshot)
+
+    assert raised.value is failure
+    assert snapshot.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [snapshot]
+    restored = DocumentStore()
+    assert restored.load(snapshot) == 1

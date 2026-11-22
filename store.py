@@ -1,6 +1,9 @@
 from typing import List, Dict, Any, Optional
+import os
 import pickle
 import threading
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from time import perf_counter
 
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -132,8 +135,20 @@ class DocumentStore:
                 "docs": self.docs.copy(),
                 "metadatas": self.metadatas.copy(),
             }
-        with open(path, "wb") as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        destination = Path(path).resolve()
+        staged_path = None
+        try:
+            with NamedTemporaryFile(
+                mode="wb", dir=destination.parent, prefix=".snapshot-", suffix=".tmp", delete=False
+            ) as staged:
+                staged_path = Path(staged.name)
+                pickle.dump(data, staged, protocol=pickle.HIGHEST_PROTOCOL)
+            # Close the staging file before replacing the destination, including on Windows.
+            os.replace(staged_path, destination)
+            staged_path = None
+        finally:
+            if staged_path is not None:
+                staged_path.unlink(missing_ok=True)
         return len(data["docs"])
 
     def load(self, path: str) -> int:

@@ -86,5 +86,9 @@ Backup and restore
 - Store snapshots in a durable volume when running in containers.
 - Save copies the document lists under the store lock, then serializes the
   captured state. Ingestion can continue while that copy is being written.
+- Save writes and closes a temporary file in the destination directory before
+  atomically replacing the snapshot. A write or replacement error preserves the
+  previous file. The process needs write access to the destination directory.
+  Power-loss durability would require additional filesystem synchronization.
 - Snapshot responses count the documents captured by save or installed by load.
   Both snapshot routes still perform their file operations on the event loop.
