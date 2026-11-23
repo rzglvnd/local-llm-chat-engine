@@ -154,10 +154,21 @@ class DocumentStore:
     def load(self, path: str) -> int:
         with open(path, "rb") as f:
             data = pickle.load(f)
+
+        # Fit against a separate store so a failed rebuild leaves live data usable.
+        restored = DocumentStore()
+        restored.ids = [str(x) for x in data.get("ids", [])]
+        restored.docs = data.get("docs", [])
+        restored.metadatas = data.get("metadatas", [])
+        restored._id_to_index = {doc_id: i for i, doc_id in enumerate(restored.ids)}
+        restored._rebuild_vectorizer()
+        documents = len(restored.docs)
+
         with self._lock:
-            self.ids = [str(x) for x in data.get("ids", [])]
-            self.docs = data.get("docs", [])
-            self.metadatas = data.get("metadatas", [])
-            self._id_to_index = {doc_id: i for i, doc_id in enumerate(self.ids)}
-            self._rebuild_vectorizer()
-            return len(self.docs)
+            self.ids = restored.ids
+            self.docs = restored.docs
+            self.metadatas = restored.metadatas
+            self._id_to_index = restored._id_to_index
+            self.vectorizer = restored.vectorizer
+            self.matrix = restored.matrix
+        return documents

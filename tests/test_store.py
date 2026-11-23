@@ -116,3 +116,26 @@ def test_failed_save_preserves_previous_snapshot(monkeypatch, tmp_path, failure_
     assert list(tmp_path.iterdir()) == [snapshot]
     restored = DocumentStore()
     assert restored.load(snapshot) == 1
+
+
+def test_failed_snapshot_rebuild_preserves_live_store(tmp_path):
+    store = DocumentStore()
+    store.ingest([
+        {"id": "one", "text": "postgres replication", "metadata": {"version": 1}},
+        {"id": "two", "text": "python interpreter"},
+    ])
+    previous_results = store.search("postgres replication", k=2)
+    previous_stats = store.stats()
+    snapshot = tmp_path / "stop-words.pkl"
+    snapshot.write_bytes(store_module.pickle.dumps({
+        "ids": ["candidate"], "docs": ["the and"], "metadatas": [{}],
+    }))
+
+    with pytest.raises(ValueError, match="empty vocabulary"):
+        store.load(snapshot)
+
+    assert store.search("postgres replication", k=2) == previous_results
+    assert store.stats() == previous_stats
+    update = store.ingest([{"id": "one", "text": "postgres logical replication"}])
+    assert update["updated"] == 1
+    assert update["total"] == 2

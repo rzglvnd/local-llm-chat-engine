@@ -90,5 +90,9 @@ Backup and restore
   atomically replacing the snapshot. A write or replacement error preserves the
   previous file. The process needs write access to the destination directory.
   Power-loss durability would require additional filesystem synchronization.
+- Restore builds a replacement index before acquiring the store lock to install
+  the documents and index together. A read or rebuild failure leaves the current
+  index searchable. A successful restore supersedes any ingestion that finished
+  before the swap. Both indexes can be in memory during the rebuild.
 - Snapshot responses count the documents captured by save or installed by load.
   Both snapshot routes still perform their file operations on the event loop.
