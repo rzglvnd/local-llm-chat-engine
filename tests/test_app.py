@@ -51,7 +51,10 @@ def test_ingest_search_and_chat_echo() -> None:
 
 
 def test_snapshot_save_and_load(tmp_path) -> None:
-    snapshot_path = tmp_path / "store.pkl"
+    snapshot_path = tmp_path / "backup" / "store.pkl"
+    missing = client.post("/snapshot/load", json={"path": str(snapshot_path)})
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": f"Snapshot not found at '{snapshot_path}'"}
 
     client.post(
         "/ingest",

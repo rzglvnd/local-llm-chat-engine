@@ -95,4 +95,7 @@ Backup and restore
   index searchable. A successful restore supersedes any ingestion that finished
   before the swap. Both indexes can be in memory during the rebuild.
 - Snapshot responses count the documents captured by save or installed by load.
-  Both snapshot routes still perform their file operations on the event loop.
+- A dedicated worker executes one HTTP snapshot operation at a time per process.
+  Directory creation, file checks, serialization, and index rebuilding run on
+  that worker. Queued snapshot requests wait without occupying search or chat
+  workers. An in-progress snapshot can finish after its requester stops waiting.

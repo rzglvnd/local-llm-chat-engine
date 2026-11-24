@@ -1,7 +1,9 @@
+import asyncio
 import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional
 from uuid import uuid4
@@ -80,6 +82,8 @@ if settings.cors_origins:
 
 store = DocumentStore()
 model = EchoModel()
+# Snapshot requests queue separately so they cannot consume chat and search workers.
+_snapshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snapshot")
 
 app.state.rate_limiter = InMemoryRateLimiter(
     limit=settings.rate_limit_requests_per_minute,
@@ -511,22 +515,32 @@ async def chat_stream(payload: ChatRequest):
         raise
 
 
-@app.post("/snapshot/save")
-async def save_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
-    path = payload.path or settings.snapshot_path
+def _save_snapshot(path: str) -> int:
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    documents = store.save(path)
+    return store.save(path)
+
+
+def _load_snapshot(path: str) -> int:
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Snapshot not found at '{path}'")
+    return store.load(path)
+
+
+@app.post("/snapshot/save")
+async def save_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
+    path = payload.path or settings.snapshot_path
+    loop = asyncio.get_running_loop()
+    documents = await loop.run_in_executor(_snapshot_executor, _save_snapshot, path)
     return {"saved": path, "documents": documents}
 
 
 @app.post("/snapshot/load")
 async def load_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
     path = payload.path or settings.snapshot_path
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=f"Snapshot not found at '{path}'")
-    documents = store.load(path)
+    loop = asyncio.get_running_loop()
+    documents = await loop.run_in_executor(_snapshot_executor, _load_snapshot, path)
     return {"loaded": path, "documents": documents}
 
 
