@@ -101,6 +101,10 @@ Snapshots
 - `POST /snapshot/save`
 - `POST /snapshot/load`
 
+Save and load share one active operation and one waiting slot per server
+process. When both slots are occupied, either route returns HTTP 503 with
+`{"detail":"Snapshot queue is full"}` before starting the requested operation.
+
 Request JSON:
 
 ```json

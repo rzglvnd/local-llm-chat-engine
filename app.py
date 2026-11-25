@@ -84,6 +84,8 @@ store = DocumentStore()
 model = EchoModel()
 # Snapshot requests queue separately so they cannot consume chat and search workers.
 _snapshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snapshot")
+_snapshot_admission_lock = Lock()
+_snapshot_slots: list[asyncio.Future[None]] = []
 
 app.state.rate_limiter = InMemoryRateLimiter(
     limit=settings.rate_limit_requests_per_minute,
@@ -528,19 +530,68 @@ def _load_snapshot(path: str) -> int:
     return store.load(path)
 
 
+def _reserve_snapshot_slot() -> asyncio.Future[None]:
+    slot = asyncio.get_running_loop().create_future()
+    with _snapshot_admission_lock:
+        # Keep at most one waiting request behind the running operation.
+        if len(_snapshot_slots) >= 2:
+            raise HTTPException(status_code=503, detail="Snapshot queue is full")
+        if not _snapshot_slots:
+            slot.set_result(None)
+        _snapshot_slots.append(slot)
+    return slot
+
+
+def _wake_snapshot_slot(slot: asyncio.Future[None]) -> None:
+    if not slot.done():
+        slot.set_result(None)
+
+
+def _release_snapshot_slot(slot: asyncio.Future[None]) -> None:
+    with _snapshot_admission_lock:
+        was_first = _snapshot_slots[0] is slot
+        _snapshot_slots.remove(slot)
+        if was_first and _snapshot_slots:
+            next_slot = _snapshot_slots[0]
+            next_slot.get_loop().call_soon_threadsafe(_wake_snapshot_slot, next_slot)
+
+
+async def _run_snapshot(operation: Callable[[str], int], path: str) -> int:
+    slot = _reserve_snapshot_slot()
+    try:
+        await slot
+        work = _snapshot_executor.submit(operation, path)
+    except BaseException:
+        _release_snapshot_slot(slot)
+        raise
+    # The worker owns the slot once submitted, even if its requester is cancelled.
+    work.add_done_callback(lambda _: _release_snapshot_slot(slot))
+    result = asyncio.wrap_future(work)
+    try:
+        return await asyncio.shield(result)
+    except asyncio.CancelledError:
+        result.add_done_callback(_log_abandoned_snapshot_error)
+        raise
+
+
+def _log_abandoned_snapshot_error(result: asyncio.Future[int]) -> None:
+    if not result.cancelled():
+        error = result.exception()
+        if error is not None:
+            logger.error("Snapshot operation failed after request cancellation", exc_info=error)
+
+
 @app.post("/snapshot/save")
 async def save_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
     path = payload.path or settings.snapshot_path
-    loop = asyncio.get_running_loop()
-    documents = await loop.run_in_executor(_snapshot_executor, _save_snapshot, path)
+    documents = await _run_snapshot(_save_snapshot, path)
     return {"saved": path, "documents": documents}
 
 
 @app.post("/snapshot/load")
 async def load_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
     path = payload.path or settings.snapshot_path
-    loop = asyncio.get_running_loop()
-    documents = await loop.run_in_executor(_snapshot_executor, _load_snapshot, path)
+    documents = await _run_snapshot(_load_snapshot, path)
     return {"loaded": path, "documents": documents}
 
 

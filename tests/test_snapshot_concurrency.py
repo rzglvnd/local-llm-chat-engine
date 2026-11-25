@@ -10,7 +10,7 @@ from store import DocumentStore
 
 
 @pytest.mark.parametrize("first_action", ["save", "load"])
-def test_snapshot_requests_serialize_without_blocking_health(monkeypatch, tmp_path, first_action):
+def test_snapshot_overload_does_not_block_health(monkeypatch, tmp_path, first_action):
     snapshot = tmp_path / "backup" / "store.pkl"
     snapshot.parent.mkdir()
     backup = DocumentStore()
@@ -52,9 +52,9 @@ def test_snapshot_requests_serialize_without_blocking_health(monkeypatch, tmp_pa
         monkeypatch.setattr(live, second_action, check_order)
         transport = httpx.ASGITransport(app=api.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            async def request(action):
+            async def request(action, path=snapshot):
                 return await client.post(
-                    f"/snapshot/{action}", json={"path": str(snapshot)},
+                    f"/snapshot/{action}", json={"path": str(path)},
                     headers={"X-API-Key": "test-key"},
                 )
 
@@ -63,16 +63,20 @@ def test_snapshot_requests_serialize_without_blocking_health(monkeypatch, tmp_pa
             try:
                 await asyncio.wait_for(entered.wait(), timeout=5)
                 assert not watchdog_expired.is_set(), "snapshot operation blocked the event loop"
-                submit = api._snapshot_executor.submit
+                reserve = api._reserve_snapshot_slot
 
-                def observe_submit(*args, **kwargs):
-                    future = submit(*args, **kwargs)
+                def observe_reservation():
+                    slot = reserve()
                     queued.set()
-                    return future
+                    return slot
 
-                monkeypatch.setattr(api._snapshot_executor, "submit", observe_submit)
+                monkeypatch.setattr(api, "_reserve_snapshot_slot", observe_reservation)
                 second = asyncio.create_task(request(second_action))
                 await asyncio.wait_for(queued.wait(), timeout=5)
+                excess_path = tmp_path / "excess.pkl"
+                excess = await asyncio.wait_for(request("save", excess_path), timeout=5)
+                assert excess.status_code == 503
+                assert excess.json() == {"detail": "Snapshot queue is full"}
                 health = await asyncio.wait_for(client.get("/health"), timeout=5)
                 assert health.status_code == 200
                 assert health.json() == {"status": "ok"}
@@ -96,5 +100,103 @@ def test_snapshot_requests_serialize_without_blocking_health(monkeypatch, tmp_pa
             assert response.status_code == 200
             hit, = response.json()["results"]
             assert hit["id"] == expected_id
+            assert not excess_path.exists()
+            retry = await request("save", excess_path)
+            assert retry.status_code == 200
+            assert retry.json() == {"saved": str(excess_path), "documents": expected_count}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("active_fails", [False, True])
+def test_snapshot_cancellation_keeps_worker_slot(monkeypatch, tmp_path, caplog, active_fails):
+    live = DocumentStore()
+    live.ingest([{"id": "live", "text": "postgres replication"}])
+    save = live.save
+    active_path = tmp_path / "active.pkl"
+    cancelled_path = tmp_path / "cancelled.pkl"
+    replacement_path = tmp_path / "replacement.pkl"
+    reserve = api._reserve_snapshot_slot
+    submit = api._snapshot_executor.submit
+    monkeypatch.setattr(api, "store", live)
+    monkeypatch.setattr(api, "settings", replace(api.settings, api_key="test-key"))
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        reserved = asyncio.Event()
+        release = threading.Event()
+        submitted = []
+
+        def gated_save(path):
+            if path == str(active_path):
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=5), "snapshot worker watchdog expired"
+                if active_fails:
+                    raise OSError("snapshot write failed")
+            return save(path)
+
+        def observe_reservation():
+            slot = reserve()
+            reserved.set()
+            return slot
+
+        def observe_submission(*args, **kwargs):
+            future = submit(*args, **kwargs)
+            submitted.append(future)
+            return future
+
+        monkeypatch.setattr(live, "save", gated_save)
+        monkeypatch.setattr(api, "_reserve_snapshot_slot", observe_reservation)
+        monkeypatch.setattr(api._snapshot_executor, "submit", observe_submission)
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async def request(path):
+                return await client.post(
+                    "/snapshot/save", json={"path": str(path)},
+                    headers={"X-API-Key": "test-key"},
+                )
+
+            active = asyncio.create_task(request(active_path))
+            tasks = [active]
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                active.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await active
+
+                reserved.clear()
+                waiting = asyncio.create_task(request(cancelled_path))
+                tasks.append(waiting)
+                await asyncio.wait_for(reserved.wait(), timeout=5)
+                assert not submitted[0].done()
+                excess = await asyncio.wait_for(request(replacement_path), timeout=5)
+                assert excess.status_code == 503
+
+                waiting.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiting
+                reserved.clear()
+                replacement = asyncio.create_task(request(replacement_path))
+                tasks.append(replacement)
+                await asyncio.wait_for(reserved.wait(), timeout=5)
+                assert len(submitted) == 1
+                assert not replacement.done()
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
+                if submitted:
+                    await asyncio.wait_for(
+                        asyncio.gather(asyncio.wrap_future(submitted[0]), return_exceptions=True),
+                        timeout=5,
+                    )
+
+            assert replacement.result().status_code == 200
+            assert len(submitted) == 2
+            assert active_path.is_file() is not active_fails
+            assert replacement_path.is_file()
+            assert not cancelled_path.exists()
+            if active_fails:
+                assert "Snapshot operation failed after request cancellation" in caplog.text
 
     asyncio.run(scenario())

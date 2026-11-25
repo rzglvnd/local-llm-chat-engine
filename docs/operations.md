@@ -97,5 +97,6 @@ Backup and restore
 - Snapshot responses count the documents captured by save or installed by load.
 - A dedicated worker executes one HTTP snapshot operation at a time per process.
   Directory creation, file checks, serialization, and index rebuilding run on
-  that worker. Queued snapshot requests wait without occupying search or chat
-  workers. An in-progress snapshot can finish after its requester stops waiting.
+  that worker. Save and restore share one waiting slot, and excess requests get
+  HTTP 503. Cancelling a request while it waits frees the slot before any work
+  is submitted. After submission, the worker holds its slot until it finishes.
