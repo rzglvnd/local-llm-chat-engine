@@ -100,3 +100,12 @@ Backup and restore
   that worker. Save and restore share one waiting slot, and excess requests get
   HTTP 503. Cancelling a request while it waits frees the slot before any work
   is submitted. After submission, the worker holds its slot until it finishes.
+
+When request logging is enabled, each completed snapshot worker operation emits
+a `snapshot_complete` record with its request ID, action, and outcome. Match the
+ID to the `X-Request-ID` response header or the request log. `queue_ms` measures
+admission to worker start, including the handoff to the executor. `worker_ms`
+measures the snapshot operation itself, including file I/O and any index rebuild.
+High queue time points to earlier work occupying the worker. High worker time
+points to the operation itself. The worker records completion even if the caller
+has stopped waiting. Requests rejected with `503` appear in the request log.

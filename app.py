@@ -86,6 +86,7 @@ model = EchoModel()
 _snapshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snapshot")
 _snapshot_admission_lock = Lock()
 _snapshot_slots: list[asyncio.Future[None]] = []
+_snapshot_clock = time.perf_counter
 
 app.state.rate_limiter = InMemoryRateLimiter(
     limit=settings.rate_limit_requests_per_minute,
@@ -298,6 +299,7 @@ def _safe_stream_text(text: str):
 @app.middleware("http")
 async def attach_request_id_and_log(request: Request, call_next):
     request_id = request.headers.get("x-request-id", uuid4().hex)
+    request.state.request_id = request_id
     start = time.perf_counter()
 
     rate_decision = None
@@ -556,11 +558,36 @@ def _release_snapshot_slot(slot: asyncio.Future[None]) -> None:
             next_slot.get_loop().call_soon_threadsafe(_wake_snapshot_slot, next_slot)
 
 
-async def _run_snapshot(operation: Callable[[str], int], path: str) -> int:
+def _execute_snapshot(
+    operation: Callable[[str], int], path: str, action: str, request_id: str, admitted_at: float,
+) -> int:
+    started_at = _snapshot_clock()
+    outcome = "succeeded"
+    try:
+        return operation(path)
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        if settings.request_logging:
+            finished_at = _snapshot_clock()
+            logger.info(
+                "snapshot_complete request_id=%r action=%s outcome=%s queue_ms=%.2f worker_ms=%.2f",
+                request_id, action, outcome,
+                (started_at - admitted_at) * 1000, (finished_at - started_at) * 1000,
+            )
+
+
+async def _run_snapshot(
+    operation: Callable[[str], int], path: str, *, action: str, request_id: str,
+) -> int:
     slot = _reserve_snapshot_slot()
     try:
+        admitted_at = _snapshot_clock()
         await slot
-        work = _snapshot_executor.submit(operation, path)
+        work = _snapshot_executor.submit(
+            _execute_snapshot, operation, path, action, request_id, admitted_at,
+        )
     except BaseException:
         _release_snapshot_slot(slot)
         raise
@@ -582,16 +609,24 @@ def _log_abandoned_snapshot_error(result: asyncio.Future[int]) -> None:
 
 
 @app.post("/snapshot/save")
-async def save_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
+async def save_snapshot(
+    payload: SnapshotRequest, request: Request, _: None = Depends(require_api_key),
+):
     path = payload.path or settings.snapshot_path
-    documents = await _run_snapshot(_save_snapshot, path)
+    documents = await _run_snapshot(
+        _save_snapshot, path, action="save", request_id=request.state.request_id,
+    )
     return {"saved": path, "documents": documents}
 
 
 @app.post("/snapshot/load")
-async def load_snapshot(payload: SnapshotRequest, _: None = Depends(require_api_key)):
+async def load_snapshot(
+    payload: SnapshotRequest, request: Request, _: None = Depends(require_api_key),
+):
     path = payload.path or settings.snapshot_path
-    documents = await _run_snapshot(_load_snapshot, path)
+    documents = await _run_snapshot(
+        _load_snapshot, path, action="load", request_id=request.state.request_id,
+    )
     return {"loaded": path, "documents": documents}
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 from dataclasses import replace
 
@@ -10,7 +11,7 @@ from store import DocumentStore
 
 
 @pytest.mark.parametrize("first_action", ["save", "load"])
-def test_snapshot_overload_does_not_block_health(monkeypatch, tmp_path, first_action):
+def test_snapshot_overload_does_not_block_health(monkeypatch, tmp_path, caplog, first_action):
     snapshot = tmp_path / "backup" / "store.pkl"
     snapshot.parent.mkdir()
     backup = DocumentStore()
@@ -22,7 +23,14 @@ def test_snapshot_overload_does_not_block_health(monkeypatch, tmp_path, first_ac
         {"id": "extra", "text": "python interpreter"},
     ])
     monkeypatch.setattr(api, "store", live)
-    monkeypatch.setattr(api, "settings", replace(api.settings, api_key="test-key"))
+    monkeypatch.setattr(
+        api, "settings", replace(api.settings, api_key="test-key", request_logging=True),
+    )
+    caplog.set_level(logging.INFO, logger=api.logger.name)
+    # Admission and start for the first request, admission for the second,
+    # first completion, then the second request's start and completion.
+    ticks = iter([0.0, 0.125, 0.25, 1.0, 1.125, 1.375])
+    monkeypatch.setattr(api, "_snapshot_clock", lambda: next(ticks, 2.0))
     second_action = "load" if first_action == "save" else "save"
     first_operation = getattr(live, first_action)
     second_operation = getattr(live, second_action)
@@ -52,10 +60,13 @@ def test_snapshot_overload_does_not_block_health(monkeypatch, tmp_path, first_ac
         monkeypatch.setattr(live, second_action, check_order)
         transport = httpx.ASGITransport(app=api.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            async def request(action, path=snapshot):
+            async def request(action, path=snapshot, request_id=None):
+                headers = {"X-API-Key": "test-key"}
+                if request_id is not None:
+                    headers["X-Request-ID"] = request_id
                 return await client.post(
                     f"/snapshot/{action}", json={"path": str(path)},
-                    headers={"X-API-Key": "test-key"},
+                    headers=headers,
                 )
 
             first = asyncio.create_task(request(first_action))
@@ -71,7 +82,7 @@ def test_snapshot_overload_does_not_block_health(monkeypatch, tmp_path, first_ac
                     return slot
 
                 monkeypatch.setattr(api, "_reserve_snapshot_slot", observe_reservation)
-                second = asyncio.create_task(request(second_action))
+                second = asyncio.create_task(request(second_action, request_id="queued-request"))
                 await asyncio.wait_for(queued.wait(), timeout=5)
                 excess_path = tmp_path / "excess.pkl"
                 excess = await asyncio.wait_for(request("save", excess_path), timeout=5)
@@ -96,6 +107,16 @@ def test_snapshot_overload_does_not_block_health(monkeypatch, tmp_path, first_ac
                 key = "saved" if action == "save" else "loaded"
                 assert response.json() == {key: str(snapshot), "documents": expected_count}
 
+            first_id = first.result().headers["X-Request-ID"]
+            assert second.result().headers["X-Request-ID"] == "queued-request"
+            completions = [msg for msg in caplog.messages if msg.startswith("snapshot_complete ")]
+            assert completions == [
+                f"snapshot_complete request_id={first_id!r} action={first_action} "
+                "outcome=succeeded queue_ms=125.00 worker_ms=875.00",
+                f"snapshot_complete request_id='queued-request' action={second_action} "
+                "outcome=succeeded queue_ms=875.00 worker_ms=250.00",
+            ]
+
             response = await client.post("/search", json={"query": "replication", "k": 1})
             assert response.status_code == 200
             hit, = response.json()["results"]
@@ -119,7 +140,10 @@ def test_snapshot_cancellation_keeps_worker_slot(monkeypatch, tmp_path, caplog, 
     reserve = api._reserve_snapshot_slot
     submit = api._snapshot_executor.submit
     monkeypatch.setattr(api, "store", live)
-    monkeypatch.setattr(api, "settings", replace(api.settings, api_key="test-key"))
+    monkeypatch.setattr(
+        api, "settings", replace(api.settings, api_key="test-key", request_logging=True),
+    )
+    caplog.set_level(logging.INFO, logger=api.logger.name)
 
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -154,7 +178,7 @@ def test_snapshot_cancellation_keeps_worker_slot(monkeypatch, tmp_path, caplog, 
             async def request(path):
                 return await client.post(
                     "/snapshot/save", json={"path": str(path)},
-                    headers={"X-API-Key": "test-key"},
+                    headers={"X-API-Key": "test-key", "X-Request-ID": path.stem},
                 )
 
             active = asyncio.create_task(request(active_path))
@@ -196,6 +220,10 @@ def test_snapshot_cancellation_keeps_worker_slot(monkeypatch, tmp_path, caplog, 
             assert active_path.is_file() is not active_fails
             assert replacement_path.is_file()
             assert not cancelled_path.exists()
+            completion = "snapshot_complete request_id='active' action=save"
+            outcome = "failed" if active_fails else "succeeded"
+            assert f"{completion} outcome={outcome} queue_ms=" in caplog.text
+            assert "snapshot_complete request_id='cancelled'" not in caplog.text
             if active_fails:
                 assert "Snapshot operation failed after request cancellation" in caplog.text
 
