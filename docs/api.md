@@ -37,6 +37,12 @@ Response:
 { "received": 1, "ingested": 1, "updated": 0, "total": 1, "time_s": 0.002 }
 ```
 
+`POST /ingest` returns HTTP 422 if applying the batch would leave the TF-IDF
+corpus with no indexable terms. The previous documents and index stay
+searchable. Add descriptive words to the documents and retry. A document
+containing only stop words can be accepted if the resulting corpus still
+contains indexable terms.
+
 Search
 
 - `POST /search`

@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from app import app, store
 from rate_limit import InMemoryRateLimiter
@@ -48,6 +49,54 @@ def test_ingest_search_and_chat_echo() -> None:
     body = chat_resp.json()
     assert body["model"] == "echo"
     assert "response" in body
+
+
+def test_ingest_returns_422_when_resulting_corpus_has_no_indexable_terms() -> None:
+    http = TestClient(app, raise_server_exceptions=False)
+    initial = http.post(
+        "/ingest", json={"documents": [{"id": "d1", "text": "postgres recovery"}]},
+    )
+    assert initial.status_code == 200
+    query = {"query": "postgres recovery", "k": 2}
+    before = http.post("/search", json=query)
+    assert before.status_code == 200
+
+    rejected = http.post("/ingest", json={"documents": [
+        {"id": "d1", "text": "the and"}, {"id": "d2", "text": "the or"},
+    ]})
+    assert rejected.status_code == 422
+    assert rejected.json() == {
+        "detail": (
+            "The resulting corpus has no indexable terms. Add descriptive words to the documents."
+        ),
+    }
+    after = http.post("/search", json=query)
+    assert after.status_code == 200
+    assert after.json() == before.json()
+
+    retried = http.post("/ingest", json={"documents": [
+        {"id": "d1", "text": "postgres recovery guide"}, {"id": "d2", "text": "the or"},
+    ]})
+    assert retried.status_code == 200
+    summary = retried.json()
+    assert summary.pop("time_s") >= 0
+    assert summary == {"received": 2, "ingested": 1, "updated": 1, "total": 2}
+    searched = http.post("/search", json=query)
+    assert searched.status_code == 200
+    hits = searched.json()["results"]
+    assert [(hit["id"], hit["text"]) for hit in hits] == [
+        ("d1", "postgres recovery guide"), ("d2", "the or"),
+    ]
+
+
+def test_ingest_keeps_unexpected_vectorizer_errors_as_500(monkeypatch) -> None:
+    def fail_fit(*args, **kwargs):
+        raise ValueError("unexpected vectorizer failure")
+
+    monkeypatch.setattr(TfidfVectorizer, "fit_transform", fail_fit)
+    http = TestClient(app, raise_server_exceptions=False)
+    response = http.post("/ingest", json={"documents": [{"text": "postgres recovery"}]})
+    assert response.status_code == 500
 
 
 def test_snapshot_save_and_load(tmp_path) -> None:

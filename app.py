@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from engine import EchoModel
 from rate_limit import InMemoryRateLimiter
 from settings import load_settings
-from store import DocumentStore
+from store import DocumentStore, EmptyVocabularyError
 
 settings = load_settings()
 
@@ -366,7 +366,10 @@ async def ready():
 @app.post("/ingest")
 async def ingest(payload: IngestRequest, _: None = Depends(require_api_key)):
     documents = _normalize_documents(payload.documents)
-    return await run_in_threadpool(store.ingest, documents)
+    try:
+        return await run_in_threadpool(store.ingest, documents)
+    except EmptyVocabularyError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.post("/ingest_embeddings")

@@ -1,3 +1,3 @@
-from store import DocumentStore
+from store import DocumentStore, EmptyVocabularyError
 
-__all__ = ["DocumentStore"]
+__all__ = ["DocumentStore", "EmptyVocabularyError"]

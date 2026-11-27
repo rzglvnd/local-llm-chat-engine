@@ -11,6 +11,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
 
+class EmptyVocabularyError(ValueError):
+    """The resulting corpus contains no terms the TF-IDF analyzer can index."""
+
+
 class DocumentStore:
     """In-memory document store with TF-IDF retrieval.
 
@@ -30,8 +34,22 @@ class DocumentStore:
 
     def _rebuild_vectorizer(self) -> None:
         if self.docs:
-            self.vectorizer = TfidfVectorizer(stop_words="english")
-            self.matrix = self.vectorizer.fit_transform(self.docs)
+            vectorizer = TfidfVectorizer(stop_words="english")
+            try:
+                matrix = vectorizer.fit_transform(self.docs)
+            except ValueError as error:
+                # Confirm the cause with the configured analyzer on the failure path.
+                analyze = vectorizer.build_analyzer()
+                if all(isinstance(doc, str) for doc in self.docs) and not any(
+                    analyze(doc) for doc in self.docs
+                ):
+                    raise EmptyVocabularyError(
+                        "The resulting corpus has no indexable terms. "
+                        "Add descriptive words to the documents."
+                    ) from error
+                raise
+            self.vectorizer = vectorizer
+            self.matrix = matrix
         else:
             self.vectorizer = None
             self.matrix = None

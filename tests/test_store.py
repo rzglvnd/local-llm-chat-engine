@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 import app as api
 import store as store_module
-from local_llm_chat_engine.store import DocumentStore
+from local_llm_chat_engine.store import DocumentStore, EmptyVocabularyError
 
 
 def test_ingest_and_search():
@@ -31,7 +31,7 @@ def test_failed_ingest_preserves_live_store_and_allows_retry():
     previous_results = store.search("postgres recovery", k=2)
     previous_stats = store.stats()
 
-    with pytest.raises(ValueError, match="empty vocabulary"):
+    with pytest.raises(EmptyVocabularyError):
         store.ingest([
             {"id": "one", "text": "the and", "metadata": {"version": 2}},
             {"id": "two", "text": "the or"},
@@ -159,7 +159,7 @@ def test_failed_snapshot_rebuild_preserves_live_store(tmp_path):
         "ids": ["candidate"], "docs": ["the and"], "metadatas": [{}],
     }))
 
-    with pytest.raises(ValueError, match="empty vocabulary"):
+    with pytest.raises(EmptyVocabularyError):
         store.load(snapshot)
 
     assert store.search("postgres replication", k=2) == previous_results
