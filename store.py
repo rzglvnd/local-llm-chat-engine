@@ -36,6 +36,15 @@ class DocumentStore:
             self.vectorizer = None
             self.matrix = None
 
+    def _install_index(self, prepared: "DocumentStore") -> None:
+        """Install the prepared corpus and index while the live store lock is held."""
+        self.ids = prepared.ids
+        self.docs = prepared.docs
+        self.metadatas = prepared.metadatas
+        self._id_to_index = prepared._id_to_index
+        self.vectorizer = prepared.vectorizer
+        self.matrix = prepared.matrix
+
     def stats(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -65,6 +74,12 @@ class DocumentStore:
         updated = 0
 
         with self._lock:
+            staged = DocumentStore()
+            staged.ids = self.ids.copy()
+            staged.docs = self.docs.copy()
+            staged.metadatas = self.metadatas.copy()
+            staged._id_to_index = self._id_to_index.copy()
+
             for doc in documents:
                 if not isinstance(doc, dict):
                     continue
@@ -74,23 +89,24 @@ class DocumentStore:
                     continue
 
                 incoming_id = doc.get("id")
-                doc_id = str(incoming_id) if incoming_id else f"doc_{len(self.docs) + 1}"
+                doc_id = str(incoming_id) if incoming_id else f"doc_{len(staged.docs) + 1}"
                 metadata = doc.get("metadata") or {}
 
-                existing_index = self._id_to_index.get(doc_id)
+                existing_index = staged._id_to_index.get(doc_id)
                 if existing_index is not None:
-                    self.docs[existing_index] = text
-                    self.metadatas[existing_index] = metadata
+                    staged.docs[existing_index] = text
+                    staged.metadatas[existing_index] = metadata
                     updated += 1
                 else:
-                    self.ids.append(doc_id)
-                    self.docs.append(text)
-                    self.metadatas.append(metadata)
-                    self._id_to_index[doc_id] = len(self.docs) - 1
+                    staged._id_to_index[doc_id] = len(staged.docs)
+                    staged.ids.append(doc_id)
+                    staged.docs.append(text)
+                    staged.metadatas.append(metadata)
                     ingested += 1
 
             if ingested or updated:
-                self._rebuild_vectorizer()
+                staged._rebuild_vectorizer()
+                self._install_index(staged)
 
             total_docs = len(self.docs)
 
@@ -165,10 +181,5 @@ class DocumentStore:
         documents = len(restored.docs)
 
         with self._lock:
-            self.ids = restored.ids
-            self.docs = restored.docs
-            self.metadatas = restored.metadatas
-            self._id_to_index = restored._id_to_index
-            self.vectorizer = restored.vectorizer
-            self.matrix = restored.matrix
+            self._install_index(restored)
         return documents

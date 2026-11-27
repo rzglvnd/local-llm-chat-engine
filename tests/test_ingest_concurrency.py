@@ -11,7 +11,7 @@ from store import DocumentStore
 def test_health_responds_during_tfidf_rebuild_and_search_sees_new_document(monkeypatch):
     store = DocumentStore()
     store.ingest([{"id": "existing", "text": "python interpreter"}])
-    rebuild = store._rebuild_vectorizer
+    rebuild = DocumentStore._rebuild_vectorizer
     search = store.search
     monkeypatch.setattr(api, "store", store)
     monkeypatch.setattr(api, "settings", replace(api.settings, api_key="test-key"))
@@ -23,18 +23,18 @@ def test_health_responds_during_tfidf_rebuild_and_search_sees_new_document(monke
         release = threading.Event()
         watchdog_expired = threading.Event()
 
-        def gated_rebuild():
+        def gated_rebuild(staged):
             loop.call_soon_threadsafe(rebuild_entered.set)
             # The watchdog can release the rebuild even if the event loop stalls.
             if not release.wait(timeout=5):
                 watchdog_expired.set()
-            rebuild()
+            rebuild(staged)
 
         def observed_search(query, k):
             loop.call_soon_threadsafe(search_entered.set)
             return search(query, k=k)
 
-        monkeypatch.setattr(store, "_rebuild_vectorizer", gated_rebuild)
+        monkeypatch.setattr(DocumentStore, "_rebuild_vectorizer", gated_rebuild)
         monkeypatch.setattr(store, "search", observed_search)
         transport = httpx.ASGITransport(app=api.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

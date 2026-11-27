@@ -25,6 +25,34 @@ def test_ingest_and_search():
     assert ids <= {"1", "3"}
 
 
+def test_failed_ingest_preserves_live_store_and_allows_retry():
+    store = DocumentStore()
+    store.ingest([{"id": "one", "text": "postgres recovery", "metadata": {"version": 1}}])
+    previous_results = store.search("postgres recovery", k=2)
+    previous_stats = store.stats()
+
+    with pytest.raises(ValueError, match="empty vocabulary"):
+        store.ingest([
+            {"id": "one", "text": "the and", "metadata": {"version": 2}},
+            {"id": "two", "text": "the or"},
+        ])
+
+    assert store.stats() == previous_stats
+    assert store.search("postgres recovery", k=2) == previous_results
+
+    retry = store.ingest([
+        {"id": "one", "text": "postgres recovery guide", "metadata": {"version": 2}},
+        {"id": "two", "text": "python interpreter"},
+    ])
+    assert retry.pop("time_s") >= 0
+    assert retry == {"received": 2, "ingested": 1, "updated": 1, "total": 2}
+    first, second = store.search("postgres recovery", k=2)
+    assert (first["id"], first["text"], first["metadata"]) == (
+        "one", "postgres recovery guide", {"version": 2},
+    )
+    assert second["id"] == "two"
+
+
 def test_save_captures_documents_before_concurrent_ingest(monkeypatch, tmp_path):
     store = DocumentStore()
     store.ingest([{"id": "one", "text": "original text", "metadata": {"version": 1}}])

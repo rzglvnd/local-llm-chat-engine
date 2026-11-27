@@ -43,8 +43,13 @@ checks the ranked results, the configured `k` limit, and the fallback label.
 TF-IDF ingestion
 
 `/ingest` runs the document update and index rebuild in the shared thread pool.
-The store lock covers both steps, so a search that arrives mid-rebuild waits for
-the new index. `/health` can respond while the ingest and search are pending.
+The store stages changes and fits the candidate index under the store lock.
+It publishes the documents and index together on success. A batch that fails
+to fit leaves the previous corpus searchable. The staged documents and index
+can occupy memory alongside the live versions during the rebuild.
+
+A search that arrives mid-rebuild waits for the outcome. `/health` can respond
+while the ingest and search are pending.
 `tests/test_ingest_concurrency.py` exercises that ordering and verifies that the
 waiting search returns the newly indexed document. Worker capacity and the
 shared lock still limit concurrent ingestion and search.
