@@ -43,16 +43,16 @@ checks the ranked results, the configured `k` limit, and the fallback label.
 TF-IDF ingestion
 
 `/ingest` runs the document update and index rebuild in the shared thread pool.
-The store stages changes and fits the candidate index under the store lock.
-It publishes the documents and index together on success. A batch that fails
-to fit leaves the previous corpus searchable. The staged documents and index
-can occupy memory alongside the live versions during the rebuild.
+Ingestion holds a writer lock from copying the current corpus through fitting
+the candidate index and publishing it. Search can use the previous corpus while
+the fit runs. On success, the documents and index switch together under the lock
+used by search. A failed fit leaves the previous corpus searchable. The two
+versions can occupy memory at the same time during the rebuild.
 
-A search that arrives mid-rebuild waits for the outcome. `/health` can respond
-while the ingest and search are pending.
-`tests/test_ingest_concurrency.py` exercises that ordering and verifies that the
-waiting search returns the newly indexed document. Worker capacity and the
-shared lock still limit concurrent ingestion and search.
+The writer lock also covers reset and restore publication. An ingest waiting
+for that lock starts from the corpus published by the preceding writer. Ingestion
+and search still share worker capacity, and publication can wait for an active
+search to finish.
 
 Rate limiting
 
@@ -95,7 +95,7 @@ Backup and restore
   atomically replacing the snapshot. A write or replacement error preserves the
   previous file. The process needs write access to the destination directory.
   Power-loss durability would require additional filesystem synchronization.
-- Restore builds a replacement index before acquiring the store lock to install
+- Restore builds a replacement index before acquiring both store locks to install
   the documents and index together. A read or rebuild failure leaves the current
   index searchable. A successful restore supersedes any ingestion that finished
   before the swap. Both indexes can be in memory during the rebuild.

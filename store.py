@@ -24,6 +24,8 @@ class DocumentStore:
     """
 
     def __init__(self):
+        # Writers take this lock before the live-state lock. Readers only need _lock.
+        self._writer_lock = threading.Lock()
         self._lock = threading.RLock()
         self.docs: List[str] = []
         self.metadatas: List[Dict[str, Any]] = []
@@ -55,7 +57,7 @@ class DocumentStore:
             self.matrix = None
 
     def _install_index(self, prepared: "DocumentStore") -> None:
-        """Install the prepared corpus and index while the live store lock is held."""
+        """Install the prepared corpus and index while both store locks are held."""
         self.ids = prepared.ids
         self.docs = prepared.docs
         self.metadatas = prepared.metadatas
@@ -71,7 +73,7 @@ class DocumentStore:
             }
 
     def reset(self) -> None:
-        with self._lock:
+        with self._writer_lock, self._lock:
             self.docs = []
             self.metadatas = []
             self.ids = []
@@ -91,7 +93,8 @@ class DocumentStore:
         ingested = 0
         updated = 0
 
-        with self._lock:
+        with self._writer_lock:
+            # The other writers cannot replace the corpus while we copy or fit it.
             staged = DocumentStore()
             staged.ids = self.ids.copy()
             staged.docs = self.docs.copy()
@@ -124,7 +127,8 @@ class DocumentStore:
 
             if ingested or updated:
                 staged._rebuild_vectorizer()
-                self._install_index(staged)
+                with self._lock:
+                    self._install_index(staged)
 
             total_docs = len(self.docs)
 
@@ -163,7 +167,7 @@ class DocumentStore:
 
     def save(self, path: str) -> int:
         with self._lock:
-            # Ingestion can append rows or replace their fields during serialization.
+            # Capture matching document lists before writing to disk.
             data = {
                 "ids": self.ids.copy(),
                 "docs": self.docs.copy(),
@@ -198,6 +202,6 @@ class DocumentStore:
         restored._rebuild_vectorizer()
         documents = len(restored.docs)
 
-        with self._lock:
+        with self._writer_lock, self._lock:
             self._install_index(restored)
         return documents
